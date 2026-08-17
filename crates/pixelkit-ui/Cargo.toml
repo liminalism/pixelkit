@@ -1,0 +1,20 @@
+[package]
+name = "pixelkit-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pixelkit-raster = { workspace = true }
+pixelkit-text = { workspace = true }
+pixelkit-shell = { workspace = true }
+
+[dev-dependencies]
+pixelkit-text = { workspace = true, features = ["test-fonts"] }
+
+[features]
+test-fonts = ["pixelkit-text/test-fonts"]
+
+[lints]
+workspace = true
