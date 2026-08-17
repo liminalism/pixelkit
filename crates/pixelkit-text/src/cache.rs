@@ -65,9 +65,12 @@ pub struct TextCache {
     fitted_bytes: usize,
     /// Wrap results, keyed by width and style; a paragraph redrawn every
     /// frame is wrapped once.
-    wrapped: HashMap<(i32, u64), HashMap<Rc<str>, Rc<[std::ops::Range<usize>]>>>,
+    wrapped: HashMap<(i32, u64), HashMap<Rc<str>, Lines>>,
     wrapped_count: usize,
 }
+
+/// Byte ranges of the lines a string wraps into.
+pub type Lines = Rc<[std::ops::Range<usize>]>;
 
 /// The cache key for a style: face, size to a tenth of a pixel, tracking to
 /// a thousandth of an em.
