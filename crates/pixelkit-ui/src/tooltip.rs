@@ -51,7 +51,9 @@ impl Tooltip {
 
     /// Draw the pending tooltip (if any) inside `bounds`, then clear it.
     pub fn draw(&mut self, ui: &mut Ui<'_>, bounds: Rect, style: TooltipStyle) {
-        let Some(request) = self.request.take() else { return };
+        let Some(request) = self.request.take() else {
+            return;
+        };
         if request.lines.is_empty() {
             return;
         }
@@ -80,14 +82,23 @@ impl Tooltip {
         }
         let rect = Rect::new(x, y, w, h);
         ui.painter.push_clip(bounds);
-        ui.painter.shadow_rect(rect, ui.px(2), ui.px(3), 0x101010, 40);
+        ui.painter
+            .shadow_rect(rect, ui.px(2), ui.px(3), 0x101010, 40);
         ui.painter.fill_rect(rect, style.fill);
-        ui.painter.stroke_rect(rect, ui.scale.hairline(), style.edge);
+        ui.painter
+            .stroke_rect(rect, ui.scale.hairline(), style.edge);
         let inner = rect.inset(padding);
         let mut cy = inner.y;
         for (line_h, text_style, colour, text) in rows {
-            ui.text
-                .draw_fitted(&mut ui.painter, &text, inner, cy, text_style, colour, Align::Left);
+            ui.text.draw_fitted(
+                &mut ui.painter,
+                &text,
+                inner,
+                cy,
+                text_style,
+                colour,
+                Align::Left,
+            );
             cy += line_h;
         }
         ui.painter.pop_clip();
@@ -110,17 +121,38 @@ mod tests {
         let mut kernel = RasterKernel::new();
         let mut input = Input::new();
         let mut tip = Tooltip::new();
-        tip.request(195, 95, vec![("hello world".into(), test_style(16.0), 0xffffff)]);
+        tip.request(
+            195,
+            95,
+            vec![("hello world".into(), test_style(16.0), 0xffffff)],
+        );
         {
-            let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input, Theme::default(), Scale::ONE, &mut kernel);
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                Theme::default(),
+                Scale::ONE,
+                &mut kernel,
+            );
             ui.painter.clear(0);
-            let style = TooltipStyle { fill: 0x202020, edge: 0x404040, padding: 4, max_width: 150, offset: (10, 10) };
+            let style = TooltipStyle {
+                fill: 0x202020,
+                edge: 0x404040,
+                padding: 4,
+                max_width: 150,
+                offset: (10, 10),
+            };
             tip.draw(&mut ui, Rect::new(0, 0, 200, 100), style);
         }
         assert!(!tip.is_pending());
         // Ink landed left of and above the anchor, not off-screen.
         let lit = buffer.pixels.iter().filter(|&&p| p != 0).count();
         assert!(lit > 0);
-        assert_eq!(buffer.pixels[99 * 200 + 199], 0, "nothing at the far corner");
+        assert_eq!(
+            buffer.pixels[99 * 200 + 199],
+            0,
+            "nothing at the far corner"
+        );
     }
 }

@@ -462,7 +462,10 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
     }
 }
 
-pub fn run_app<A: PixelApp>(app: A, config: WindowConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_app<A: PixelApp>(
+    app: A,
+    config: WindowConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     let mut app = app;
     app.attach(Waker {

@@ -74,7 +74,11 @@ fn crc32(bytes: &[u8]) -> u32 {
     for &b in bytes {
         crc ^= u32::from(b);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { 0xedb8_8320 ^ (crc >> 1) } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                0xedb8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -125,7 +129,9 @@ mod tests {
     #[test]
     fn a_small_image_round_trips() {
         let mut buffer = WindowBuffer::new(3, 2);
-        buffer.pixels.copy_from_slice(&[0xff0000, 0x00ff00, 0x0000ff, 0x102030, 0xffffff, 0]);
+        buffer
+            .pixels
+            .copy_from_slice(&[0xff0000, 0x00ff00, 0x0000ff, 0x102030, 0xffffff, 0]);
         let png = encode(&buffer);
         assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
         // IHDR at 8: len(4) type(4) data(13) crc(4) = 25 bytes; IDAT follows.
@@ -133,7 +139,10 @@ mod tests {
         assert_eq!(&png[37..41], b"IDAT");
         let zlib = &png[41..41 + idat_len];
         let raw = inflate_stored(zlib);
-        assert_eq!(raw, vec![0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0x10, 0x20, 0x30, 255, 255, 255, 0, 0, 0]);
+        assert_eq!(
+            raw,
+            vec![0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0x10, 0x20, 0x30, 255, 255, 255, 0, 0, 0]
+        );
     }
 
     #[test]

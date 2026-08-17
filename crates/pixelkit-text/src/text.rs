@@ -86,9 +86,18 @@ pub fn shape_face(set: &FontSet, face_id: FaceId, text: &str) -> ShapedText {
 
     let spacing_slots = runs
         .iter()
-        .map(|run| run.glyphs.iter().filter(|glyph| !run.face.is_mark(glyph.glyph)).count())
+        .map(|run| {
+            run.glyphs
+                .iter()
+                .filter(|glyph| !run.face.is_mark(glyph.glyph))
+                .count()
+        })
         .sum();
-    ShapedText { runs, tracking: 0.0, spacing_slots }
+    ShapedText {
+        runs,
+        tracking: 0.0,
+        spacing_slots,
+    }
 }
 
 impl ShapedText {
@@ -149,7 +158,11 @@ impl ShapedText {
         for run in &self.runs {
             let scale = run.scale(size_px);
             for glyph in &run.glyphs {
-                let spacing = if run.face.is_mark(glyph.glyph) { 0.0 } else { tracking };
+                let spacing = if run.face.is_mark(glyph.glyph) {
+                    0.0
+                } else {
+                    tracking
+                };
                 *clusters.entry(glyph.cluster).or_insert(0.0) += glyph.x_advance * scale + spacing;
             }
         }
@@ -417,36 +430,52 @@ fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
 ///    break.
 ///
 /// Returns byte ranges into `text`.
-pub fn wrap(set: &FontSet, style: TextStyle, text: &str, max_width_px: f32) -> Vec<std::ops::Range<usize>> {
-    let size_px = style.size;
+pub fn wrap(
+    set: &FontSet,
+    style: TextStyle,
+    text: &str,
+    max_width_px: f32,
+) -> Vec<std::ops::Range<usize>> {
     if text.is_empty() {
         // One empty line, not zero lines: an empty string still occupies a
         // row on a receipt.
         return vec![std::ops::Range { start: 0, end: 0 }];
     }
+    // Shape once and take per-cluster advances from that, exactly as `fit`
+    // does. Measuring every prefix by reshaping is quadratic — a paragraph of
+    // forty words was costing a millisecond a frame per paragraph.
+    let shaped = shape(set, style, text);
+    let size_px = style.size;
+    let tracking = shaped.tracking * size_px;
+    let mut clusters: BTreeMap<usize, f32> = BTreeMap::new();
+    for run in &shaped.runs {
+        let scale = run.scale(size_px);
+        for glyph in &run.glyphs {
+            let spacing = if run.face.is_mark(glyph.glyph) {
+                0.0
+            } else {
+                tracking
+            };
+            *clusters.entry(glyph.cluster).or_insert(0.0) += glyph.x_advance * scale + spacing;
+        }
+    }
+    let clusters: Vec<(usize, f32)> = clusters.into_iter().collect();
 
     let mut lines = Vec::new();
     let mut line_start = 0usize;
+    let mut used = 0.0f32;
     let mut last_space: Option<usize> = None;
-
     let mut index = 0usize;
-    while index < text.len() {
-        let Some(character) = text[index..].chars().next() else {
-            break;
-        };
-        let next = index + character.len_utf8();
-
+    while index < clusters.len() {
+        let (offset, advance) = clusters[index];
+        let character = text[offset..].chars().next().unwrap_or(' ');
         if character == ' ' {
-            last_space = Some(index);
+            last_space = Some(offset);
         }
-
-        let width = shape(set, style, &text[line_start..next]).width(size_px);
-        // A single character wider than the line still has to go somewhere;
-        // emitting it alone beats looping forever.
-        if width > max_width_px && next > line_start && index > line_start {
+        if used + advance > max_width_px && offset > line_start {
             let mut split = match last_space {
                 Some(space) if space > line_start => space + 1,
-                _ => index,
+                _ => offset,
             };
             // Rule 1: walk back off any combining marks.
             while split > line_start
@@ -462,16 +491,21 @@ pub fn wrap(set: &FontSet, style: TextStyle, text: &str, max_width_px: f32) -> V
                     .unwrap_or(1);
             }
             if split <= line_start {
-                split = index;
+                split = offset;
             }
             lines.push(line_start..split);
             line_start = split;
             last_space = None;
-            // Re-measure from the new start rather than advancing.
-            index = split;
+            // Re-measure from the new start.
+            index = clusters
+                .iter()
+                .position(|(o, _)| *o >= split)
+                .unwrap_or(clusters.len());
+            used = 0.0;
             continue;
         }
-        index = next;
+        used += advance;
+        index += 1;
     }
 
     if line_start < text.len() || lines.is_empty() {

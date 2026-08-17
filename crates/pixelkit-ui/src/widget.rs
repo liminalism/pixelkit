@@ -156,7 +156,14 @@ impl<'a> Ui<'a> {
     }
 
     /// One line of text in an explicit style, vertically centred in `area`.
-    pub fn label_styled(&mut self, area: Rect, value: &str, style: TextStyle, colour: u32, align: Align) {
+    pub fn label_styled(
+        &mut self,
+        area: Rect,
+        value: &str,
+        style: TextStyle,
+        colour: u32,
+        align: Align,
+    ) {
         let size = style;
         let height = self.text.line_height(size);
         let y = area.y + (area.h - height) / 2;
@@ -1416,7 +1423,14 @@ mod table_tests {
             row_height: ROW_HEIGHT,
             ..Theme::default()
         };
-        let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, input, theme, Scale::ONE, &mut kernel);
+        let mut ui = Ui::new(
+            Painter::new(&mut buffer),
+            &mut text,
+            input,
+            theme,
+            Scale::ONE,
+            &mut kernel,
+        );
         ui.table(state, area, &columns(), keys, |index| Row {
             cells: vec![Cell::new(format!("ข้าว {index}")), Cell::new("฿70.00")],
         })
@@ -1516,7 +1530,14 @@ mod table_tests {
         };
         let mut built = 0usize;
         {
-            let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input, theme, Scale::ONE, &mut kernel);
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                theme,
+                Scale::ONE,
+                &mut kernel,
+            );
             ui.table(&mut state, area, &columns(), &keys, |_index| {
                 built += 1;
                 Row {
@@ -1597,7 +1618,14 @@ mod table_tests {
                 row_height: ROW_HEIGHT,
                 ..Theme::default()
             };
-            let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input, theme, Scale::ONE, &mut kernel);
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                theme,
+                Scale::ONE,
+                &mut kernel,
+            );
             ui.table(&mut state, area, &columns(), &keys, |index| Row {
                 cells: vec![Cell::new(format!("ข้าวสาร {index}")), Cell::new("฿70.00")],
             });

@@ -8,8 +8,12 @@
 use pixelkit_raster::{png, Painter, WindowBuffer};
 use pixelkit_text::{Face, FaceId, FontSet, TextCache, TextStyle};
 
-const SAMPLE: &str = "ORDERFLOWER 6,042.25 ×1 ½× ¼× Δ σ — ← → · … ⌄ bid/ask 0.62 CAUSAL FIELD 18 LEVELS";
-const CHECK: &[char] = &['Δ', 'σ', '¼', '½', '·', '—', '×', '…', '←', '→', '⌄', '−', '↺', 'Ⅱ', '▷', '│', '•', '°', '±', '≥', '≤', '€', '£', '¥', 'µ'];
+const SAMPLE: &str =
+    "ORDERFLOWER 6,042.25 ×1 ½× ¼× Δ σ — ← → · … ⌄ bid/ask 0.62 CAUSAL FIELD 18 LEVELS";
+const CHECK: &[char] = &[
+    'Δ', 'σ', '¼', '½', '·', '—', '×', '…', '←', '→', '⌄', '−', '↺', 'Ⅱ', '▷', '│', '•', '°', '±',
+    '≥', '≤', '€', '£', '¥', 'µ',
+];
 const SIZES: &[f32] = &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 24.0];
 
 fn main() {
@@ -32,8 +36,11 @@ fn main() {
         }
     } else {
         for path in &args {
-            let bytes: &'static [u8] = Box::leak(std::fs::read(path).expect("read font").into_boxed_slice());
-            let face: &'static Face = Box::leak(Box::new(Face::from_bytes(bytes).expect("parse font (TrueType glyf only)")));
+            let bytes: &'static [u8] =
+                Box::leak(std::fs::read(path).expect("read font").into_boxed_slice());
+            let face: &'static Face = Box::leak(Box::new(
+                Face::from_bytes(bytes).expect("parse font (TrueType glyf only)"),
+            ));
             set.add(face);
             names.push(path.clone());
         }
@@ -48,13 +55,41 @@ fn main() {
     let mut y = 10;
     for (index, name) in names.iter().enumerate() {
         let face = FaceId(index as u8);
-        let missing: String = CHECK.iter().filter(|c| !set.face(face).covers(**c)).collect();
-        println!("{name}: missing {}", if missing.is_empty() { "nothing from the check list".to_string() } else { missing.chars().map(|c| format!("{c} (U+{:04X})", c as u32)).collect::<Vec<_>>().join(", ") });
-        cache.draw(&mut painter, name, 10, y, TextStyle::new(face, 12.0), 0x9a4f3d);
+        let missing: String = CHECK
+            .iter()
+            .filter(|c| !set.face(face).covers(**c))
+            .collect();
+        println!(
+            "{name}: missing {}",
+            if missing.is_empty() {
+                "nothing from the check list".to_string()
+            } else {
+                missing
+                    .chars()
+                    .map(|c| format!("{c} (U+{:04X})", c as u32))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        cache.draw(
+            &mut painter,
+            name,
+            10,
+            y,
+            TextStyle::new(face, 12.0),
+            0x9a4f3d,
+        );
         y += 20;
         for size in SIZES {
             let style = TextStyle::tracked(face, *size, 0.06);
-            cache.draw(&mut painter, &format!("{size:>4}px "), 10, y, TextStyle::new(face, 9.0), 0x68727b);
+            cache.draw(
+                &mut painter,
+                &format!("{size:>4}px "),
+                10,
+                y,
+                TextStyle::new(face, 9.0),
+                0x68727b,
+            );
             cache.draw(&mut painter, SAMPLE, 60, y, style, 0x182027);
             y += *size as i32 + 10;
         }

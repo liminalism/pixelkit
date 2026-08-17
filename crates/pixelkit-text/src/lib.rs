@@ -14,4 +14,6 @@ pub mod text;
 
 pub use cache::{Align, TextCache};
 pub use font::{Face, FaceId, FontSet, TextStyle};
-pub use text::{line_height, render, render_shaped, shape, shape_face, wrap, RenderedText, ShapedText};
+pub use text::{
+    line_height, render, render_shaped, shape, shape_face, wrap, RenderedText, ShapedText,
+};

@@ -245,11 +245,19 @@ pub struct TextStyle {
 
 impl TextStyle {
     pub const fn new(face: FaceId, size: f32) -> TextStyle {
-        TextStyle { face, size, tracking: 0.0 }
+        TextStyle {
+            face,
+            size,
+            tracking: 0.0,
+        }
     }
 
     pub const fn tracked(face: FaceId, size: f32, tracking: f32) -> TextStyle {
-        TextStyle { face, size, tracking }
+        TextStyle {
+            face,
+            size,
+            tracking,
+        }
     }
 
     pub fn with_size(self, size: f32) -> TextStyle {

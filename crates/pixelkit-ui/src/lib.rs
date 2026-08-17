@@ -11,8 +11,8 @@ pub mod widget;
 
 pub use chrome::ButtonStyle;
 pub use list::{ScrollList, ScrollState};
-pub use tooltip::TooltipStyle;
 pub use tooltip::Tooltip;
+pub use tooltip::TooltipStyle;
 pub use widget::{
     column_widths, navigate, Cell, CellAppearance, Column, Row, TableOutcome, TableState,
     TextFieldState, Theme, Ui, Width,

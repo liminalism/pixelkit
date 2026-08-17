@@ -71,12 +71,22 @@ impl Ui<'_> {
 
         if needs_bar {
             let track = Rect::new(viewport.right(), area.y, gutter, area.h);
-            let thumb_h = ((area.h as i64 * area.h as i64) / content.max(1) as i64).max(self.px(18) as i64) as i32;
+            let thumb_h = ((area.h as i64 * area.h as i64) / content.max(1) as i64)
+                .max(self.px(18) as i64) as i32;
             let max = ScrollState::max_offset(viewport.h, content);
             let travel = (area.h - thumb_h).max(0);
-            let thumb_y = if max > 0 { area.y + (travel as i64 * offset as i64 / max as i64) as i32 } else { area.y };
+            let thumb_y = if max > 0 {
+                area.y + (travel as i64 * offset as i64 / max as i64) as i32
+            } else {
+                area.y
+            };
             let inset = self.px(2);
-            let bar = Rect::new(track.x + inset, thumb_y, (gutter - inset * 2).max(1), thumb_h.min(area.h));
+            let bar = Rect::new(
+                track.x + inset,
+                thumb_y,
+                (gutter - inset * 2).max(1),
+                thumb_h.min(area.h),
+            );
             self.painter.fill_rect(bar, self.theme.panel_edge);
         }
 
@@ -109,7 +119,14 @@ mod tests {
 
         let mut drawn = Vec::new();
         {
-            let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input, Theme::default(), Scale::ONE, &mut kernel);
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                Theme::default(),
+                Scale::ONE,
+                &mut kernel,
+            );
             let out = ui.scroll_list(&mut state, area, &heights, |_, i, _| drawn.push(i));
             assert_eq!(out.visible, (0, 4));
             assert!(out.viewport.w < 200, "a gutter was reserved");
@@ -120,7 +137,14 @@ mod tests {
         input.scrolled(0.0, 95.0);
         drawn.clear();
         {
-            let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input, Theme::default(), Scale::ONE, &mut kernel);
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                Theme::default(),
+                Scale::ONE,
+                &mut kernel,
+            );
             let out = ui.scroll_list(&mut state, area, &heights, |_, i, _| drawn.push(i));
             assert_eq!(state.offset(), 95);
             assert_eq!(out.visible, (3, 7));
@@ -137,8 +161,20 @@ mod tests {
         input.cursor_moved(50.0, 50.0);
         input.scrolled(0.0, 40.0);
         let mut state = ScrollState::new();
-        let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input, Theme::default(), Scale::ONE, &mut kernel);
-        let out = ui.scroll_list(&mut state, Rect::new(0, 0, 200, 100), &[20, 20], |_, _, _| {});
+        let mut ui = Ui::new(
+            Painter::new(&mut buffer),
+            &mut text,
+            &mut input,
+            Theme::default(),
+            Scale::ONE,
+            &mut kernel,
+        );
+        let out = ui.scroll_list(
+            &mut state,
+            Rect::new(0, 0, 200, 100),
+            &[20, 20],
+            |_, _, _| {},
+        );
         assert_eq!(state.offset(), 0);
         assert_eq!(out.viewport.w, 200);
     }

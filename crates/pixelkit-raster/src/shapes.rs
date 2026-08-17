@@ -8,6 +8,10 @@ use crate::path::Path;
 
 impl Painter<'_> {
     /// Fill a rectangle with a colour at a constant opacity (0..=255).
+    ///
+    /// Row spans through the coverage kernel rather than a per-pixel blend:
+    /// a panel-sized tint at 2× is a million pixels, and the per-pixel path
+    /// with its clip test was the single most expensive thing in a frame.
     pub fn blend_rect(&mut self, rect: Rect, color: u32, alpha: u8) {
         if alpha == 255 {
             self.fill_rect(rect, color);
@@ -17,11 +21,20 @@ impl Painter<'_> {
         if visible.is_empty() || alpha == 0 {
             return;
         }
-        for y in visible.y..visible.bottom() {
-            for x in visible.x..visible.right() {
-                self.blend(x, y, color, alpha);
-            }
+        thread_local! {
+            static SPAN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        SPAN.with(|span| {
+            let mut span = span.borrow_mut();
+            let width = visible.w as usize;
+            if span.len() < width || span.first().copied() != Some(alpha) {
+                span.clear();
+                span.resize(width.max(64), alpha);
+            }
+            for y in visible.y..visible.bottom() {
+                self.blend_coverage_row(visible.x, y, color, &span[..width]);
+            }
+        });
     }
 
     /// One-pixel horizontal hairline covering `[x, x + width)`.
@@ -73,55 +86,126 @@ impl Painter<'_> {
                 self.blend_coverage_row(x0 as i32, y, color, span);
             } else {
                 scaled.clear();
-                scaled.extend(span.iter().map(|&c| ((u32::from(c) * u32::from(alpha) + 127) / 255) as u8));
+                scaled.extend(
+                    span.iter()
+                        .map(|&c| ((u32::from(c) * u32::from(alpha) + 127) / 255) as u8),
+                );
                 self.blend_coverage_row(x0 as i32, y, color, &scaled);
             }
         });
     }
 
     /// Anti-aliased filled circle.
-    pub fn fill_circle_aa(&mut self, kernel: &mut RasterKernel, cx: f32, cy: f32, r: f32, color: u32, alpha: u8) {
+    pub fn fill_circle_aa(
+        &mut self,
+        kernel: &mut RasterKernel,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        color: u32,
+        alpha: u8,
+    ) {
         let mut path = Path::new();
         path.circle(cx, cy, r);
         self.fill_path(kernel, &mut path, color, alpha);
     }
 
     /// Anti-aliased ring of outer radius `r` and stroke `width`.
-    pub fn stroke_circle_aa(&mut self, kernel: &mut RasterKernel, cx: f32, cy: f32, r: f32, width: f32, color: u32, alpha: u8) {
+    pub fn stroke_circle_aa(
+        &mut self,
+        kernel: &mut RasterKernel,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        width: f32,
+        color: u32,
+        alpha: u8,
+    ) {
         let mut path = Path::new();
         path.ring(cx, cy, r, width);
         self.fill_path(kernel, &mut path, color, alpha);
     }
 
     /// Anti-aliased rounded rectangle.
-    pub fn fill_rounded_rect_aa(&mut self, kernel: &mut RasterKernel, rect: Rect, radius: f32, color: u32, alpha: u8) {
+    pub fn fill_rounded_rect_aa(
+        &mut self,
+        kernel: &mut RasterKernel,
+        rect: Rect,
+        radius: f32,
+        color: u32,
+        alpha: u8,
+    ) {
         let mut path = Path::new();
-        path.rounded_rect(rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32, radius);
+        path.rounded_rect(
+            rect.x as f32,
+            rect.y as f32,
+            rect.w as f32,
+            rect.h as f32,
+            radius,
+        );
         self.fill_path(kernel, &mut path, color, alpha);
     }
 
     /// Anti-aliased polyline stroke (butt caps, unjoined segments).
-    pub fn stroke_polyline_aa(&mut self, kernel: &mut RasterKernel, points: &[[f32; 2]], width: f32, color: u32, alpha: u8) {
+    pub fn stroke_polyline_aa(
+        &mut self,
+        kernel: &mut RasterKernel,
+        points: &[[f32; 2]],
+        width: f32,
+        color: u32,
+        alpha: u8,
+    ) {
         let mut path = Path::new();
         path.stroke_polyline(points, width);
         self.fill_path(kernel, &mut path, color, alpha);
     }
 
     /// Anti-aliased line segment.
-    pub fn line_aa(&mut self, kernel: &mut RasterKernel, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: u32, alpha: u8) {
+    pub fn line_aa(
+        &mut self,
+        kernel: &mut RasterKernel,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        width: f32,
+        color: u32,
+        alpha: u8,
+    ) {
         self.stroke_polyline_aa(kernel, &[[x0, y0], [x1, y1]], width, color, alpha);
     }
 
-    /// A cheap soft shadow: a few offset, progressively fainter alpha rects
-    /// under `rect`. Draw before the panel itself.
+    /// A cheap soft shadow: `spread` one-pixel rings outside `rect`, each
+    /// fainter than the last, shifted down by `offset_y`. Only the rings are
+    /// blended — the interior is about to be covered by the panel — so the
+    /// cost is the perimeter, not the area.
     pub fn shadow_rect(&mut self, rect: Rect, offset_y: i32, spread: i32, color: u32, alpha: u8) {
         if spread <= 0 || alpha == 0 {
             return;
         }
-        for i in (1..=spread).rev() {
-            let a = (u32::from(alpha) * (spread - i + 1) as u32 / (spread as u32 * (spread as u32 + 1) / 2).max(1)).min(255) as u8;
-            let r = Rect::new(rect.x - i, rect.y - i + offset_y, rect.w + 2 * i, rect.h + 2 * i);
-            self.blend_rect(r, color, a);
+        let total = (spread * (spread + 1) / 2).max(1) as u32;
+        for i in 1..=spread {
+            let a = (u32::from(alpha) * (spread - i + 1) as u32 / total).min(255) as u8;
+            if a == 0 {
+                continue;
+            }
+            let r = Rect::new(
+                rect.x - i,
+                rect.y - i + offset_y,
+                rect.w + 2 * i,
+                rect.h + 2 * i,
+            );
+            let inner = Rect::new(
+                rect.x - i + 1,
+                rect.y - i + offset_y + 1,
+                rect.w + 2 * i - 2,
+                rect.h + 2 * i - 2,
+            );
+            // Top and bottom rows of the ring, then the side columns between.
+            self.blend_rect(Rect::new(r.x, r.y, r.w, 1), color, a);
+            self.blend_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), color, a);
+            self.blend_rect(Rect::new(r.x, inner.y, 1, inner.h), color, a);
+            self.blend_rect(Rect::new(r.right() - 1, inner.y, 1, inner.h), color, a);
         }
     }
 }
@@ -143,7 +227,11 @@ mod tests {
         // Nothing right of x = 20 was touched.
         for y in 0..40 {
             for x in 20..40 {
-                assert_eq!(buffer.pixels[y * 40 + x], 0, "({x},{y}) painted outside clip");
+                assert_eq!(
+                    buffer.pixels[y * 40 + x],
+                    0,
+                    "({x},{y}) painted outside clip"
+                );
             }
         }
         // The centre column just inside the clip is fully lit.

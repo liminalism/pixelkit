@@ -17,9 +17,14 @@ use crate::text::{self, RenderedText};
 /// distinct strings; this is generous enough never to thrash and small enough
 /// never to matter.
 const CACHE_LIMIT: usize = 512;
+/// A desktop terminal draws several hundred distinct strings a frame; the
+/// default limits are for that. Constructors take explicit ones.
+pub const DEFAULT_ENTRY_LIMIT: usize = 4096;
+pub const DEFAULT_BITMAP_BUDGET: usize = 48 * 1024 * 1024;
 /// Raster data, not entry count, is what dominates the cache on a small
 /// machine. Four MiB is enough for the stable text on every current screen
 /// without allowing a report full of long labels to grow indefinitely.
+#[cfg(test)]
 const BITMAP_BUDGET: usize = 4 * 1024 * 1024;
 /// Truncation strings are tiny beside bitmaps, but user/data-derived labels
 /// still need a byte bound rather than only an entry bound.
@@ -36,6 +41,11 @@ pub enum Align {
 /// Rendered text, kept between frames.
 pub struct TextCache {
     fonts: &'static FontSet,
+    entry_limit: usize,
+    bitmap_budget: usize,
+    /// Wholesale clears since creation — a frame that clears every frame is
+    /// a cache too small for its screen.
+    evictions: u64,
     /// Nested by style so the inner map can look up an `Rc<str>` with `&str`.
     /// A tuple key would construct a fresh owned `String` on every cache
     /// hit — an allocation for every label on every frame.
@@ -53,6 +63,10 @@ pub struct TextCache {
     fitted: HashMap<(i32, u64), HashMap<Rc<str>, Rc<str>>>,
     fitted_count: usize,
     fitted_bytes: usize,
+    /// Wrap results, keyed by width and style; a paragraph redrawn every
+    /// frame is wrapped once.
+    wrapped: HashMap<(i32, u64), HashMap<Rc<str>, Rc<[std::ops::Range<usize>]>>>,
+    wrapped_count: usize,
 }
 
 /// The cache key for a style: face, size to a tenth of a pixel, tracking to
@@ -65,15 +79,54 @@ fn style_key(style: TextStyle) -> u64 {
 
 impl TextCache {
     pub fn new(fonts: &'static FontSet) -> TextCache {
+        TextCache::with_limits(fonts, DEFAULT_ENTRY_LIMIT, DEFAULT_BITMAP_BUDGET)
+    }
+
+    /// A cache with explicit bounds (entries, rasterized bytes).
+    pub fn with_limits(
+        fonts: &'static FontSet,
+        entry_limit: usize,
+        bitmap_budget: usize,
+    ) -> TextCache {
         Self {
             fonts,
+            entry_limit: entry_limit.max(1),
+            bitmap_budget: bitmap_budget.max(1),
+            evictions: 0,
             entries: HashMap::new(),
             entry_count: 0,
             bitmap_bytes: 0,
             fitted: HashMap::new(),
             fitted_count: 0,
             fitted_bytes: 0,
+            wrapped: HashMap::new(),
+            wrapped_count: 0,
         }
+    }
+
+    /// Line ranges for `text` wrapped into `width` pixels, cached.
+    pub fn wrap(
+        &mut self,
+        text: &str,
+        width: i32,
+        style: TextStyle,
+    ) -> Rc<[std::ops::Range<usize>]> {
+        let key = (width, style_key(style));
+        if let Some(lines) = self.wrapped.get(&key).and_then(|bucket| bucket.get(text)) {
+            return lines.clone();
+        }
+        let lines: Rc<[std::ops::Range<usize>]> =
+            text::wrap(self.fonts, style, text, width as f32).into();
+        if self.wrapped_count >= CACHE_LIMIT {
+            self.wrapped.clear();
+            self.wrapped_count = 0;
+        }
+        self.wrapped
+            .entry(key)
+            .or_default()
+            .insert(Rc::from(text), lines.clone());
+        self.wrapped_count += 1;
+        lines
     }
 
     pub fn fonts(&self) -> &'static FontSet {
@@ -93,6 +146,12 @@ impl TextCache {
         self.bitmap_bytes
     }
 
+    /// Wholesale evictions so far. Rising every frame means the limits are
+    /// too small for the screen.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
     /// Number of cached fitted strings.
     pub fn fitted_len(&self) -> usize {
         self.fitted_count
@@ -108,9 +167,11 @@ impl TextCache {
         if missing {
             let rendered = text::render(self.fonts, style, text);
             let bytes = rendered.bitmap.pixels.capacity();
-            if self.entry_count >= CACHE_LIMIT
-                || (self.entry_count > 0 && self.bitmap_bytes.saturating_add(bytes) > BITMAP_BUDGET)
+            if self.entry_count >= self.entry_limit
+                || (self.entry_count > 0
+                    && self.bitmap_bytes.saturating_add(bytes) > self.bitmap_budget)
             {
+                self.evictions += 1;
                 // Wholesale eviction is intentional: the working set is
                 // screen-sized, and an LRU would add a timestamp and mutation
                 // to every otherwise read-only cache hit.
@@ -386,12 +447,13 @@ mod tests {
 
     #[test]
     fn the_cache_is_bounded() {
-        let mut cache = cache();
+        let mut cache = TextCache::with_limits(set(), CACHE_LIMIT, BITMAP_BUDGET);
         for index in 0..CACHE_LIMIT + 10 {
             cache.measure(&format!("{index}"), style(20.0));
         }
         assert!(cache.len() <= CACHE_LIMIT);
         assert!(cache.bitmap_bytes() <= BITMAP_BUDGET);
+        assert!(cache.evictions() >= 1);
     }
 
     #[test]
@@ -440,7 +502,10 @@ mod tests {
         let mut buffer = WindowBuffer::new(50, 20);
         let mut cache = cache();
         let mut painter = Painter::new(&mut buffer);
-        assert_eq!(cache.draw(&mut painter, "", 0, 0, style(20.0), 0x00ff_ffff), 0);
+        assert_eq!(
+            cache.draw(&mut painter, "", 0, 0, style(20.0), 0x00ff_ffff),
+            0
+        );
         assert_eq!(ink(&buffer), 0);
     }
 

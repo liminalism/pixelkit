@@ -63,7 +63,15 @@ impl Path {
     }
 
     /// Cubic Bézier, flattened directly.
-    pub fn cubic_to(&mut self, c1x: f32, c1y: f32, c2x: f32, c2y: f32, x: f32, y: f32) -> &mut Path {
+    pub fn cubic_to(
+        &mut self,
+        c1x: f32,
+        c1y: f32,
+        c2x: f32,
+        c2y: f32,
+        x: f32,
+        y: f32,
+    ) -> &mut Path {
         let Some(&from) = self.points.last().filter(|_| self.open.is_some()) else {
             return self.move_to(x, y);
         };
@@ -85,7 +93,11 @@ impl Path {
 
     /// Append an axis-aligned rectangle (clockwise in device space).
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32) -> &mut Path {
-        self.move_to(x, y).line_to(x + w, y).line_to(x + w, y + h).line_to(x, y + h).close()
+        self.move_to(x, y)
+            .line_to(x + w, y)
+            .line_to(x + w, y + h)
+            .line_to(x, y + h)
+            .close()
     }
 
     /// Append a full circle as four cubic arcs.
@@ -230,8 +242,12 @@ fn push_quadratic(points: &mut Vec<[f32; 2]>, from: [f32; 2], control: [f32; 2],
 }
 
 fn push_cubic(points: &mut Vec<[f32; 2]>, p0: [f32; 2], p1: [f32; 2], p2: [f32; 2], p3: [f32; 2]) {
-    let ddx = (p0[0] - 2.0 * p1[0] + p2[0]).abs().max((p1[0] - 2.0 * p2[0] + p3[0]).abs());
-    let ddy = (p0[1] - 2.0 * p1[1] + p2[1]).abs().max((p1[1] - 2.0 * p2[1] + p3[1]).abs());
+    let ddx = (p0[0] - 2.0 * p1[0] + p2[0])
+        .abs()
+        .max((p1[0] - 2.0 * p2[0] + p3[0]).abs());
+    let ddy = (p0[1] - 2.0 * p1[1] + p2[1])
+        .abs()
+        .max((p1[1] - 2.0 * p2[1] + p3[1]).abs());
     let dev = (ddx * ddx + ddy * ddy).sqrt();
     let segments = ((dev * 0.75 / TOLERANCE).sqrt().ceil() as usize).clamp(1, 96);
     for i in 1..=segments {
@@ -285,7 +301,10 @@ mod tests {
         p.circle(20.0, 20.0, 10.0);
         let area = total_coverage(&mut p, 40, 40);
         let expected = std::f64::consts::PI * 100.0;
-        assert!((area - expected).abs() / expected < 0.01, "{area} vs {expected}");
+        assert!(
+            (area - expected).abs() / expected < 0.01,
+            "{area} vs {expected}"
+        );
     }
 
     #[test]
@@ -294,7 +313,10 @@ mod tests {
         p.ring(20.0, 20.0, 10.0, 3.0);
         let area = total_coverage(&mut p, 40, 40);
         let expected = std::f64::consts::PI * (100.0 - 49.0);
-        assert!((area - expected).abs() / expected < 0.01, "{area} vs {expected}");
+        assert!(
+            (area - expected).abs() / expected < 0.01,
+            "{area} vs {expected}"
+        );
     }
 
     #[test]
