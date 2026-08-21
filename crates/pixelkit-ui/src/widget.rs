@@ -1145,17 +1145,49 @@ impl TextFieldState {
     }
 }
 
+/// The glyph a masked field shows in place of one grapheme cluster. ASCII, so
+/// it renders in any embedded face without a fallback lookup — the one place
+/// a password field cannot afford to show a `.notdef` box instead of a dot.
+const MASK_GLYPH: &str = "*";
+
+/// How many Thai grapheme clusters (or plain characters, outside Thai) make
+/// up `text` — the unit [`mask`] shows one glyph per, so a stacked cluster
+/// like ก็ hides as one dot rather than two.
+fn cluster_count(text: &str) -> usize {
+    text.chars()
+        .filter(|&character| !pixelkit_text::font::is_thai_combining(character))
+        .count()
+}
+
+/// `text`, replaced one [`MASK_GLYPH`] per grapheme cluster.
+fn mask(text: &str) -> String {
+    MASK_GLYPH.repeat(cluster_count(text))
+}
+
 impl Ui<'_> {
     /// An editable field. Returns whether its text changed this frame.
     ///
     /// `focused` is the screen's own idea of what has focus — another piece of
-    /// state a screen owns rather than the toolkit guessing at.
+    /// state a screen owns rather than the toolkit guessing at. For a single
+    /// field or two, a plain `bool` the screen tracks is enough. For a form
+    /// with many, hand-rolling that per field stops scaling and gives up
+    /// keyboard reachability (no way to Tab between them); reach for
+    /// [`crate::Focus`] instead and pass it `focus.register()` here.
+    ///
+    /// `masked` swaps the displayed text (and the caret's measured position)
+    /// for [`mask`]ed dots — a password field — without touching
+    /// [`TextFieldState`] at all: the caret is still a byte offset into the
+    /// real text and still only ever lands on a cluster boundary, so masking
+    /// cannot desynchronise it from what backspace or the arrow keys do. The
+    /// placeholder is shown in the clear either way; it is a label ("PIN"),
+    /// not a secret.
     pub fn text_field(
         &mut self,
         state: &mut TextFieldState,
         area: Rect,
         placeholder: &str,
         focused: bool,
+        masked: bool,
     ) -> bool {
         let theme = self.theme;
         self.painter.rounded_rect(
@@ -1173,6 +1205,8 @@ impl Ui<'_> {
         let inner = area.inset(theme.padding / 2);
         if state.is_empty() && !focused {
             self.label(inner, placeholder, theme.text_dim, Align::Left);
+        } else if masked {
+            self.label(inner, &mask(state.text()), theme.text, Align::Left);
         } else {
             self.label(inner, state.text(), theme.text, Align::Left);
         }
@@ -1180,8 +1214,14 @@ impl Ui<'_> {
         if focused {
             // A caret drawn at the measured width of the text before it, so
             // it sits where the next glyph will land rather than at a guess.
+            // Masked, that means the width of *its* dots, not of the real
+            // (possibly much narrower or wider) characters they stand for.
             let before = &state.text()[..state.caret()];
-            let offset = self.text.measure(before, theme.body);
+            let offset = if masked {
+                self.text.measure(&mask(before), theme.body)
+            } else {
+                self.text.measure(before, theme.body)
+            };
             let height = self.text.line_height(theme.body);
             let top = inner.y + (inner.h - height) / 2;
             self.painter
@@ -1385,6 +1425,133 @@ mod text_field_tests {
         field.delete();
         assert!(field.is_empty());
         assert_eq!(field.caret(), 0);
+    }
+}
+
+#[cfg(test)]
+mod masked_text_field_tests {
+    use super::*;
+    use pixelkit_raster::WindowBuffer;
+    use pixelkit_text::font::test_fonts::set;
+
+    fn area() -> Rect {
+        Rect::new(0, 0, 200, 30)
+    }
+
+    fn render(text: &str, masked: bool, focused: bool) -> WindowBuffer {
+        let area = area();
+        let mut buffer = WindowBuffer::new(area.w as u32, area.h as u32);
+        let mut text_cache = TextCache::new(set());
+        let mut kernel = RasterKernel::new();
+        let mut input = Input::new();
+        let mut state = TextFieldState::with_text(text);
+        {
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text_cache,
+                &mut input,
+                Theme::default(),
+                Scale::ONE,
+                &mut kernel,
+            );
+            ui.painter.clear(0);
+            ui.text_field(&mut state, area, "placeholder", focused, masked);
+        }
+        buffer
+    }
+
+    /// Column of the leftmost pixel matching `colour`, searched only inside
+    /// `rect` — the field's focused border is drawn in the same colour as
+    /// the caret, so a search of the whole buffer would just find the left
+    /// edge of the border every time regardless of where the caret is.
+    fn first_column_in(buffer: &WindowBuffer, rect: Rect, colour: u32) -> Option<i32> {
+        for x in rect.x..rect.right() {
+            for y in rect.y..rect.bottom() {
+                if buffer.pixels[y as usize * buffer.width as usize + x as usize] == colour {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+
+    fn caret_x_after_clusters(text: &str, clusters: usize) -> Option<i32> {
+        let area = area();
+        let mut buffer = WindowBuffer::new(area.w as u32, area.h as u32);
+        let mut text_cache = TextCache::new(set());
+        let mut kernel = RasterKernel::new();
+        let mut input = Input::new();
+        let mut state = TextFieldState::with_text(text);
+        state.home();
+        for _ in 0..clusters {
+            state.move_right();
+        }
+        {
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text_cache,
+                &mut input,
+                Theme::default(),
+                Scale::ONE,
+                &mut kernel,
+            );
+            ui.painter.clear(0);
+            ui.text_field(&mut state, area, "", true, true);
+        }
+        // Inside the field's content padding, clear of the focused border.
+        let inner = area.inset(Theme::default().padding / 2);
+        first_column_in(&buffer, inner, Theme::default().accent)
+    }
+
+    #[test]
+    fn masking_hides_the_actual_characters() {
+        // Two different strings, same length: masked, they must be
+        // pixel-for-pixel indistinguishable, or the mask is leaking content.
+        let a = render("secret", true, false);
+        let b = render("xxxxxx", true, false);
+        assert_eq!(a.pixels, b.pixels);
+    }
+
+    #[test]
+    fn masking_counts_clusters_not_bytes() {
+        // ก็ is six bytes and one grapheme cluster (base + a combining tone
+        // mark); "a" is one byte and one cluster. Masked, both are a single
+        // dot — the same test `deleting` already relies on for backspace.
+        let a = render("ก็", true, false);
+        let b = render("a", true, false);
+        assert_eq!(a.pixels, b.pixels);
+    }
+
+    #[test]
+    fn masking_actually_changes_what_is_drawn() {
+        let masked = render("secret", true, false);
+        let plain = render("secret", false, false);
+        assert_ne!(masked.pixels, plain.pixels);
+    }
+
+    #[test]
+    fn an_empty_masked_field_still_shows_its_placeholder_in_the_clear() {
+        // The placeholder is a label ("PIN"), not a secret, whether or not
+        // the field itself is a masked one.
+        let masked_empty = render("", true, false);
+        let plain_empty = render("", false, false);
+        assert_eq!(masked_empty.pixels, plain_empty.pixels);
+    }
+
+    #[test]
+    fn the_caret_in_a_masked_field_advances_per_cluster_not_per_byte() {
+        let latin_one = caret_x_after_clusters("aXYZ", 1).unwrap();
+        let thai_one = caret_x_after_clusters("ก็XYZ", 1).unwrap();
+        assert_eq!(
+            latin_one, thai_one,
+            "one cluster is one dot, whatever its byte length"
+        );
+
+        let latin_two = caret_x_after_clusters("aXYZ", 2).unwrap();
+        assert!(
+            latin_two > latin_one,
+            "the caret keeps moving right with each cluster"
+        );
     }
 }
 

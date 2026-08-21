@@ -5,11 +5,19 @@
 //! (restaurant-pos), see `ATTRIBUTION.md`.
 
 pub mod chrome;
+pub mod dropdown;
+pub mod focus;
+pub mod form;
+pub mod layout;
 pub mod list;
 pub mod tooltip;
 pub mod widget;
 
 pub use chrome::ButtonStyle;
+pub use dropdown::Dropdown;
+pub use focus::Focus;
+pub use form::{CHECKBOX_SIZE, RADIO_SIZE, TOGGLE_SIZE};
+pub use layout::{columns_per_row, grid, grid_content_height, grid_item, grid_visible_range};
 pub use list::{ScrollList, ScrollState};
 pub use tooltip::Tooltip;
 pub use tooltip::TooltipStyle;

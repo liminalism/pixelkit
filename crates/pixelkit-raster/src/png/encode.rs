@@ -5,6 +5,7 @@
 
 use std::io::{self, Write};
 
+use super::checksum::{adler32, crc32};
 use crate::painter::WindowBuffer;
 
 /// Encode `buffer` (XRGB) as an RGB PNG.
@@ -60,41 +61,15 @@ pub fn write<P: AsRef<std::path::Path>>(path: P, buffer: &WindowBuffer) -> io::R
     file.flush()
 }
 
-fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+/// Shared with the decoder's tests, which build small PNGs by hand the same
+/// way this writer does.
+pub(crate) fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     let start = out.len();
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
     let crc = crc32(&out[start..]);
     out.extend_from_slice(&crc.to_be_bytes());
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                0xedb8_8320 ^ (crc >> 1)
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
-
-fn adler32(bytes: &[u8]) -> u32 {
-    let (mut a, mut b) = (1u32, 0u32);
-    for chunk in bytes.chunks(5552) {
-        for &x in chunk {
-            a += u32::from(x);
-            b += a;
-        }
-        a %= 65521;
-        b %= 65521;
-    }
-    (b << 16) | a
 }
 
 #[cfg(test)]
@@ -118,12 +93,6 @@ mod tests {
         }
         assert_eq!(adler32(&out).to_be_bytes(), zlib[i..i + 4]);
         out
-    }
-
-    #[test]
-    fn crc_matches_the_reference_vector() {
-        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
-        assert_eq!(adler32(b"Wikipedia"), 0x11e6_0398);
     }
 
     #[test]
