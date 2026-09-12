@@ -23,7 +23,10 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Theme as WinitTheme, Window, WindowId};
+
+#[cfg(target_os = "macos")]
+use winit::platform::macos::WindowAttributesExtMacOS;
 
 use crate::frame_log::FrameTimer;
 use crate::present::{Presenter, SoftbufferPresenter};
@@ -103,13 +106,28 @@ pub struct Modifiers {
     pub shift: bool,
     pub control: bool,
     pub alt: bool,
+    /// Cmd on macOS, the Windows/Super key elsewhere. Named `logo` after
+    /// winit's own `super_key()`, since "super" reads as a privilege level
+    /// to most of this codebase's readers.
+    pub logo: bool,
 }
 
 impl Modifiers {
     /// Nothing held. The common case, and worth naming so a caller reads as
     /// "a plain click" rather than "no modifiers".
     pub fn none(self) -> bool {
-        !self.shift && !self.control && !self.alt
+        !self.shift && !self.control && !self.alt && !self.logo
+    }
+
+    /// The platform's accelerator modifier for a keyboard shortcut: Cmd on
+    /// macOS, Ctrl everywhere else. A screen wiring up ⌘N/Ctrl+N checks this
+    /// instead of `control` so the shortcut is right on both platforms.
+    pub fn accel(self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.logo
+        } else {
+            self.control
+        }
     }
 }
 
@@ -175,6 +193,11 @@ pub trait PixelApp {
     fn should_exit(&self) -> bool {
         false
     }
+
+    /// The window's system theme is `dark`. Called once at startup (if the
+    /// platform reports one) and again on every change, so a screen can
+    /// switch [`crate::palette`]-style light/dark colours without polling.
+    fn on_theme(&mut self, _dark: bool) {}
 }
 
 /// How the window is opened. Sizes are logical pixels.
@@ -186,6 +209,15 @@ pub struct WindowConfig {
     pub min_width: Option<f64>,
     pub min_height: Option<f64>,
     pub resizable: bool,
+    /// macOS: draw the titlebar transparent, so content can show through it.
+    /// Ignored on every other platform.
+    pub titlebar_transparent: bool,
+    /// macOS: hide the title text in the titlebar. Ignored elsewhere.
+    pub title_hidden: bool,
+    /// macOS: let content extend under the titlebar's full-size content
+    /// view, the usual companion to `titlebar_transparent`. Ignored
+    /// elsewhere.
+    pub fullsize_content_view: bool,
 }
 
 impl WindowConfig {
@@ -197,6 +229,9 @@ impl WindowConfig {
             min_width: None,
             min_height: None,
             resizable: true,
+            titlebar_transparent: false,
+            title_hidden: false,
+            fullsize_content_view: false,
         }
     }
 
@@ -338,6 +373,13 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
         if let (Some(w), Some(h)) = (self.config.min_width, self.config.min_height) {
             attributes = attributes.with_min_inner_size(LogicalSize::new(w, h));
         }
+        #[cfg(target_os = "macos")]
+        {
+            attributes = attributes
+                .with_titlebar_transparent(self.config.titlebar_transparent)
+                .with_title_hidden(self.config.title_hidden)
+                .with_fullsize_content_view(self.config.fullsize_content_view);
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -346,6 +388,9 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
         let presenter = SoftbufferPresenter::new(window.clone()).expect("a software presenter");
         self.scale = Scale::new(window.scale_factor());
         self.app.on_scale(self.scale);
+        if let Some(theme) = window.theme() {
+            self.app.on_theme(theme == WinitTheme::Dark);
+        }
         self.window = Some(window);
         self.presenter = Some(Box::new(presenter));
     }
@@ -403,7 +448,12 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
                     shift: state.shift_key(),
                     control: state.control_key(),
                     alt: state.alt_key(),
+                    logo: state.super_key(),
                 });
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                self.app.on_theme(theme == WinitTheme::Dark);
+                self.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.app.on_cursor(position.x as f32, position.y as f32);
@@ -652,5 +702,29 @@ mod tests {
             ..Modifiers::default()
         }
         .none());
+        assert!(!Modifiers {
+            logo: true,
+            ..Modifiers::default()
+        }
+        .none());
+    }
+
+    #[test]
+    fn accel_reads_logo_on_macos_and_control_elsewhere() {
+        let ctrl_only = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let logo_only = Modifiers {
+            logo: true,
+            ..Modifiers::default()
+        };
+        if cfg!(target_os = "macos") {
+            assert!(logo_only.accel());
+            assert!(!ctrl_only.accel());
+        } else {
+            assert!(ctrl_only.accel());
+            assert!(!logo_only.accel());
+        }
     }
 }
