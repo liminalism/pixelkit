@@ -32,6 +32,22 @@ use crate::frame_log::FrameTimer;
 use crate::present::{Presenter, SoftbufferPresenter};
 use crate::scale::Scale;
 
+/// What arrives on the event loop's user channel: a wake, and, with the
+/// `accessibility` feature, a request from assistive technology.
+#[derive(Debug)]
+pub enum Host {
+    Wake,
+    #[cfg(feature = "accessibility")]
+    Accessibility(accesskit_winit::Event),
+}
+
+#[cfg(feature = "accessibility")]
+impl From<accesskit_winit::Event> for Host {
+    fn from(event: accesskit_winit::Event) -> Host {
+        Host::Accessibility(event)
+    }
+}
+
 /// A handle that wakes the window from another thread.
 ///
 /// The reason this exists is latency. Without it a client that receives its
@@ -49,7 +65,7 @@ use crate::scale::Scale;
 /// during shutdown is ordinary, not exceptional.
 #[derive(Debug, Clone)]
 pub struct Waker {
-    proxy: Option<EventLoopProxy<Wake>>,
+    proxy: Option<EventLoopProxy<Host>>,
 }
 
 /// The only user event: "look again". Deliberately carries nothing — the
@@ -68,7 +84,7 @@ impl Waker {
     /// Ask the window to run a tick and repaint as soon as it can.
     pub fn wake(&self) {
         if let Some(proxy) = &self.proxy {
-            let _ = proxy.send_event(Wake);
+            let _ = proxy.send_event(Host::Wake);
         }
     }
 }
@@ -198,6 +214,25 @@ pub trait PixelApp {
     /// platform reports one) and again on every change, so a screen can
     /// switch [`crate::palette`]-style light/dark colours without polling.
     fn on_theme(&mut self, _dark: bool) {}
+
+    /// The application's semantic tree for assistive technology, or `None`
+    /// for an application that has none.
+    ///
+    /// Asked for once when a screen reader attaches and again after every
+    /// paint while one is attached, so it describes the frame that was just
+    /// drawn: the same widgets, with the same bounds in physical pixels.
+    /// The toolkit keeps no widget identity — that is the immediate-mode
+    /// bargain — so the ids in the tree are the application's own, chosen
+    /// from what a control means rather than where it sits.
+    #[cfg(feature = "accessibility")]
+    fn accessibility_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        None
+    }
+
+    /// Assistive technology asked for an action on a node the application
+    /// published, such as a click on a button.
+    #[cfg(feature = "accessibility")]
+    fn on_accessibility_action(&mut self, _request: accesskit::ActionRequest) {}
 }
 
 /// How the window is opened. Sizes are logical pixels.
@@ -253,6 +288,14 @@ struct Shell<A: PixelApp> {
     /// When the next unprompted repaint is due, for an app that asked for an
     /// interval. `None` until the first one is scheduled.
     next_tick: Option<Instant>,
+    #[cfg(feature = "accessibility")]
+    proxy: EventLoopProxy<Host>,
+    #[cfg(feature = "accessibility")]
+    accessibility: Option<accesskit_winit::Adapter>,
+    /// Whether the application has published a tree, so updates are pushed
+    /// only to a tree that exists.
+    #[cfg(feature = "accessibility")]
+    tree_published: bool,
 }
 
 impl<A: PixelApp> Shell<A> {
@@ -284,7 +327,38 @@ impl<A: PixelApp> Shell<A> {
         let presented = Instant::now();
         self.timer
             .record(Duration::ZERO, painted - started, presented - painted);
+        // After the present, so a screen reader is never told about a frame
+        // the eyes cannot see yet.
+        self.publish_accessibility();
     }
+}
+
+impl<A: PixelApp> Shell<A> {
+    /// Push the frame just drawn to assistive technology, if any is listening
+    /// and the application has a tree to give.
+    #[cfg(feature = "accessibility")]
+    fn publish_accessibility(&mut self) {
+        if !self.tree_published {
+            return;
+        }
+        let Some(adapter) = &mut self.accessibility else {
+            return;
+        };
+        let app = &mut self.app;
+        let mut tree = None;
+        adapter.update_if_active(|| {
+            tree = app.accessibility_tree();
+            tree.take().unwrap_or_else(|| accesskit::TreeUpdate {
+                nodes: Vec::new(),
+                tree: None,
+                tree_id: accesskit::TreeId::ROOT,
+                focus: accesskit::NodeId(0),
+            })
+        });
+    }
+
+    #[cfg(not(feature = "accessibility"))]
+    fn publish_accessibility(&mut self) {}
 }
 
 /// Translate a winit key into something a counter understands.
@@ -361,7 +435,7 @@ fn scroll_pixels(delta: MouseScrollDelta) -> (f32, f32) {
     }
 }
 
-impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
+impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -380,11 +454,26 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
                 .with_title_hidden(self.config.title_hidden)
                 .with_fullsize_content_view(self.config.fullsize_content_view);
         }
+        #[cfg(feature = "accessibility")]
+        {
+            // The adapter attaches to the view before it is ever shown, so
+            // the first thing assistive technology sees is a described window.
+            attributes = attributes.with_visible(false);
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
                 .expect("a window should be creatable"),
         );
+        #[cfg(feature = "accessibility")]
+        {
+            self.accessibility = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+                event_loop,
+                &window,
+                self.proxy.clone(),
+            ));
+            window.set_visible(true);
+        }
         let presenter = SoftbufferPresenter::new(window.clone()).expect("a software presenter");
         self.scale = Scale::new(window.scale_factor());
         self.app.on_scale(self.scale);
@@ -401,9 +490,32 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
     /// the drain has to happen before the paint, and this is the one place
     /// that ordering is guaranteed regardless of how the platform schedules
     /// the two. A tick is a channel drain, so running it twice costs nothing.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _wake: Wake) {
-        self.app.tick();
-        self.request_redraw();
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Host) {
+        match event {
+            Host::Wake => {
+                self.app.tick();
+                self.request_redraw();
+            }
+            #[cfg(feature = "accessibility")]
+            Host::Accessibility(event) => {
+                use accesskit_winit::WindowEvent as Access;
+                match event.window_event {
+                    Access::InitialTreeRequested => {
+                        if let Some(tree) = self.app.accessibility_tree() {
+                            self.tree_published = true;
+                            if let Some(adapter) = &mut self.accessibility {
+                                adapter.update_if_active(|| tree);
+                            }
+                        }
+                    }
+                    Access::ActionRequested(request) => {
+                        self.app.on_accessibility_action(request);
+                        self.request_redraw();
+                    }
+                    Access::AccessibilityDeactivated => {}
+                }
+            }
+        }
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -416,6 +528,10 @@ impl<A: PixelApp> ApplicationHandler<Wake> for Shell<A> {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        #[cfg(feature = "accessibility")]
+        if let (Some(adapter), Some(window)) = (&mut self.accessibility, &self.window) {
+            adapter.process_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.app.on_exit();
@@ -516,7 +632,7 @@ pub fn run_app<A: PixelApp>(
     app: A,
     config: WindowConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::<Wake>::with_user_event().build()?;
+    let event_loop = EventLoop::<Host>::with_user_event().build()?;
     let mut app = app;
     app.attach(Waker {
         proxy: Some(event_loop.create_proxy()),
@@ -530,6 +646,12 @@ pub fn run_app<A: PixelApp>(
         scale: Scale::ONE,
         timer: FrameTimer::from_env(),
         next_tick: None,
+        #[cfg(feature = "accessibility")]
+        proxy: event_loop.create_proxy(),
+        #[cfg(feature = "accessibility")]
+        accessibility: None,
+        #[cfg(feature = "accessibility")]
+        tree_published: false,
     };
     event_loop.run_app(&mut shell)?;
     Ok(())

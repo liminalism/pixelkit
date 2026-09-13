@@ -9,6 +9,14 @@ license.workspace = true
 pixelkit-raster = { workspace = true }
 winit = { workspace = true }
 softbuffer = { workspace = true }
+accesskit_winit = { version = "0.34", default-features = false, features = ["rwh_06"], optional = true }
+accesskit = { version = "0.25", optional = true }
 
 [lints]
 workspace = true
+
+[features]
+# Publish the application's own semantic tree to platform assistive
+# technology through AccessKit. Off by default: a kiosk on a Pi has no
+# screen reader, and the adapter is a dependency the counter never pays for.
+accessibility = ["dep:accesskit", "dep:accesskit_winit"]
