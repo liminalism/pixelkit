@@ -20,16 +20,20 @@ use std::time::{Duration, Instant};
 use pixelkit_raster::WindowBuffer;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{
+    ElementState, Ime as WinitIme, MouseButton as WinitButton, MouseScrollDelta, TouchPhase,
+    WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, NamedKey, PhysicalKey};
 use winit::window::{Theme as WinitTheme, Window, WindowId};
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 
 use crate::frame_log::FrameTimer;
-use crate::present::{Presenter, SoftbufferPresenter};
+use crate::present::{PresentError, Presenter, SoftbufferPresenter};
 use crate::scale::Scale;
 
 /// What arrives on the event loop's user channel: a wake, and, with the
@@ -116,6 +120,52 @@ pub enum KeyInput {
     PageDown,
 }
 
+/// One key transition, including release, the whole committed string, and the
+/// physical key. [`PixelApp::on_key`] still receives presses only, as the
+/// first character, so existing callers keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyEvent {
+    pub key: KeyInput,
+    /// The whole string the key committed. Empty for navigation keys and for
+    /// key-up. More than one scalar when the platform delivers one.
+    pub text: String,
+    /// Debug name of the physical key (`KeyA`, `F13`, …).
+    pub physical: String,
+    pub pressed: bool,
+    pub repeat: bool,
+    pub modifiers: Modifiers,
+}
+
+/// Touch or gesture phase. Momentum is [`GesturePhase::Moved`] after
+/// [`GesturePhase::Ended`] is not invented here; the platform's phase is forwarded as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GesturePhase {
+    Started,
+    Moved,
+    Ended,
+    Cancelled,
+}
+
+/// A scroll. Line deltas stay distinct from the pixel deltas derived from them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollEvent {
+    pub pixel_dx: f32,
+    pub pixel_dy: f32,
+    /// Set when the platform reported lines rather than pixels.
+    pub line_dx: Option<f32>,
+    pub line_dy: Option<f32>,
+    pub phase: GesturePhase,
+}
+
+/// Where the IME candidate window should sit, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImeCursorArea {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Which modifiers were held when an event arrived.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Modifiers {
@@ -185,6 +235,24 @@ pub trait PixelApp {
 
     fn tick(&mut self) {}
     fn on_key(&mut self, _key: &KeyInput) {}
+
+    /// Press and release, with the full committed string and the physical key.
+    fn on_key_event(&mut self, _event: &KeyEvent) {}
+
+    /// IME composition: CJK, emoji-picker, dictation. `Commit` text belongs
+    /// in the focused field (see `TextFieldState::insert_str`); `Preedit` is
+    /// for showing the in-progress composition. Direct-key typing — Thai
+    /// stacks included — still arrives through `on_key`, unchanged.
+    fn on_ime(&mut self, _ime: &ImeEvent) {}
+
+    /// A new window title to apply, or `None` for no change. The shell drains
+    /// this every frame and calls `Window::set_title`, so per-section
+    /// subtitles need no window access. One-shot by convention: return the
+    /// title once, then `None`.
+    fn poll_title(&mut self) -> Option<String> {
+        None
+    }
+
     fn on_exit(&mut self) {}
 
     /// The modifier state changed. Delivered separately from the keys it
@@ -203,6 +271,19 @@ pub trait PixelApp {
     /// Wheel or trackpad movement, in pixels. Positive `y` scrolls content
     /// down — the direction the wheel turns, not the direction the view moves.
     fn on_scroll(&mut self, _dx: f32, _dy: f32) {}
+
+    /// Scroll with its phase and, when the platform sent lines, those lines
+    /// kept separate from the pixel conversion.
+    fn on_scroll_event(&mut self, _event: &ScrollEvent) {}
+
+    /// Pinch / magnify. `delta` is the platform's magnification step.
+    fn on_magnify(&mut self, _phase: GesturePhase, _delta: f64) {}
+
+    /// Caret rectangle for the IME candidate window, in physical pixels.
+    /// `None` leaves the platform's last rectangle alone.
+    fn ime_cursor_area(&self) -> Option<ImeCursorArea> {
+        None
+    }
 
     /// Whether the application wants the window closed. Checked after every
     /// tick, so an application can quit itself.
@@ -285,6 +366,13 @@ struct Shell<A: PixelApp> {
     buffer: WindowBuffer,
     scale: Scale,
     timer: FrameTimer,
+    /// Duration of the most recent `tick`, recorded into the next present.
+    pending_tick: Duration,
+    /// First input since the last present. Cleared when that present is timed.
+    input_at: Option<Instant>,
+    modifiers: Modifiers,
+    /// `None` selects the softbuffer presenter. Taken once in `resumed`.
+    presenter_factory: Option<PresenterFactory>,
     /// When the next unprompted repaint is due, for an app that asked for an
     /// interval. `None` until the first one is scheduled.
     next_tick: Option<Instant>,
@@ -320,13 +408,19 @@ impl<A: PixelApp> Shell<A> {
                 return;
             }
         }
+        if let Some(area) = self.app.ime_cursor_area() {
+            apply_ime(window, Some(area));
+        }
         let started = Instant::now();
         self.app.render(&mut self.buffer, self.scale);
         let painted = Instant::now();
         let _ = presenter.present(&self.buffer);
         let presented = Instant::now();
+        let input_to_present = self.input_at.take().map(|at| presented.saturating_duration_since(at));
+        let tick = self.pending_tick;
+        self.pending_tick = Duration::ZERO;
         self.timer
-            .record(Duration::ZERO, painted - started, presented - painted);
+            .record_full(tick, painted - started, presented - painted, input_to_present);
         // After the present, so a screen reader is never told about a frame
         // the eyes cannot see yet.
         self.publish_accessibility();
@@ -377,12 +471,14 @@ fn translate(logical: &Key, text: Option<&str>) -> Option<KeyInput> {
         Key::Named(NamedKey::ArrowRight) => Some(KeyInput::Right),
         Key::Named(NamedKey::ArrowUp) => Some(KeyInput::Up),
         Key::Named(NamedKey::ArrowDown) => Some(KeyInput::Down),
-        Key::Named(NamedKey::F1) => Some(KeyInput::Function(1)),
-        Key::Named(NamedKey::F2) => Some(KeyInput::Function(2)),
-        Key::Named(NamedKey::F3) => Some(KeyInput::Function(3)),
-        Key::Named(NamedKey::F4) => Some(KeyInput::Function(4)),
-        Key::Named(NamedKey::F5) => Some(KeyInput::Function(5)),
-        Key::Named(NamedKey::F12) => Some(KeyInput::Function(12)),
+        Key::Named(named) => {
+            if let Some(number) = function_key(*named) {
+                Some(KeyInput::Function(number))
+            } else {
+                text.and_then(|text| text.chars().next())
+                    .map(KeyInput::Character)
+            }
+        }
         Key::Character(characters) => characters.chars().next().map(KeyInput::Character),
         // The numpad reports its keys as text rather than as named keys on
         // some platforms; taking the text is what makes a numpad and the top
@@ -390,6 +486,157 @@ fn translate(logical: &Key, text: Option<&str>) -> Option<KeyInput> {
         _ => text
             .and_then(|text| text.chars().next())
             .map(KeyInput::Character),
+    }
+}
+
+/// IME composition, as the application sees it: a dependency-free mirror of
+/// `winit::event::Ime`, so tests never need a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImeEvent {
+    /// The input method attached; expect `Preedit`/`Commit` to follow.
+    Enabled,
+    /// In-progress composition and an optional byte-indexed cursor range.
+    /// An empty string clears the composition.
+    Preedit(String, Option<(usize, usize)>),
+    /// Finished text to insert into the focused field.
+    Commit(String),
+    /// The input method detached; drop any pending composition.
+    Disabled,
+}
+
+fn function_key(named: NamedKey) -> Option<u8> {
+    Some(match named {
+        NamedKey::F1 => 1,
+        NamedKey::F2 => 2,
+        NamedKey::F3 => 3,
+        NamedKey::F4 => 4,
+        NamedKey::F5 => 5,
+        NamedKey::F6 => 6,
+        NamedKey::F7 => 7,
+        NamedKey::F8 => 8,
+        NamedKey::F9 => 9,
+        NamedKey::F10 => 10,
+        NamedKey::F11 => 11,
+        NamedKey::F12 => 12,
+        NamedKey::F13 => 13,
+        NamedKey::F14 => 14,
+        NamedKey::F15 => 15,
+        NamedKey::F16 => 16,
+        NamedKey::F17 => 17,
+        NamedKey::F18 => 18,
+        NamedKey::F19 => 19,
+        NamedKey::F20 => 20,
+        NamedKey::F21 => 21,
+        NamedKey::F22 => 22,
+        NamedKey::F23 => 23,
+        NamedKey::F24 => 24,
+        _ => return None,
+    })
+}
+
+/// The whole string a key committed. Navigation keys contribute nothing, so
+/// Tab stays a key instead of the `"\t"` winit attaches to it.
+pub fn committed_text(logical: &Key, text: Option<&str>) -> String {
+    match logical {
+        Key::Character(characters) => {
+            if let Some(text) = text.filter(|text| !text.is_empty()) {
+                text.to_string()
+            } else {
+                characters.to_string()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+pub fn physical_label(key: PhysicalKey) -> String {
+    match key {
+        PhysicalKey::Code(code) => format!("{code:?}"),
+        PhysicalKey::Unidentified(native) => format!("unidentified:{native:?}"),
+    }
+}
+
+pub fn interpret_key(
+    logical: &Key,
+    text: Option<&str>,
+    physical: &str,
+    pressed: bool,
+    repeat: bool,
+    modifiers: Modifiers,
+) -> Option<KeyEvent> {
+    let key = translate(logical, text)?;
+    Some(KeyEvent {
+        key,
+        text: if pressed {
+            committed_text(logical, text)
+        } else {
+            String::new()
+        },
+        physical: physical.to_string(),
+        pressed,
+        repeat,
+        modifiers,
+    })
+}
+
+pub fn gesture_phase(phase: TouchPhase) -> GesturePhase {
+    match phase {
+        TouchPhase::Started => GesturePhase::Started,
+        TouchPhase::Moved => GesturePhase::Moved,
+        TouchPhase::Ended => GesturePhase::Ended,
+        TouchPhase::Cancelled => GesturePhase::Cancelled,
+    }
+}
+
+/// Pixel deltas for existing callers, plus the original line deltas when the
+/// platform reported lines.
+pub fn scroll_event(delta: MouseScrollDelta, phase: TouchPhase) -> ScrollEvent {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => ScrollEvent {
+            pixel_dx: x * PIXELS_PER_LINE,
+            pixel_dy: y * PIXELS_PER_LINE,
+            line_dx: Some(x),
+            line_dy: Some(y),
+            phase: gesture_phase(phase),
+        },
+        MouseScrollDelta::PixelDelta(position) => ScrollEvent {
+            pixel_dx: position.x as f32,
+            pixel_dy: position.y as f32,
+            line_dx: None,
+            line_dy: None,
+            phase: gesture_phase(phase),
+        },
+    }
+}
+
+/// Turn IME on and, when the app has a caret rectangle, park the candidate
+/// window on it.
+pub fn apply_ime(window: &Window, area: Option<ImeCursorArea>) {
+    window.set_ime_allowed(true);
+    if let Some(area) = area {
+        window.set_ime_cursor_area(
+            PhysicalPosition::new(area.x, area.y),
+            PhysicalSize::new(area.width.max(1.0), area.height.max(1.0)),
+        );
+    }
+}
+
+fn translate_ime(ime: &WinitIme) -> ImeEvent {
+    match ime {
+        WinitIme::Enabled => ImeEvent::Enabled,
+        WinitIme::Preedit(text, cursor) => ImeEvent::Preedit(text.clone(), *cursor),
+        WinitIme::Commit(text) => ImeEvent::Commit(text.clone()),
+        WinitIme::Disabled => ImeEvent::Disabled,
+    }
+}
+
+/// Apply a pending title request, if any. Split out so the one-shot
+/// convention is testable without a window: with no window yet, the app is
+/// not even asked, so an early title is never lost.
+fn drain_title<A: PixelApp>(app: &mut A, window: Option<&Window>) {
+    let Some(window) = window else { return };
+    if let Some(title) = app.poll_title() {
+        window.set_title(&title);
     }
 }
 
@@ -474,14 +721,20 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
             ));
             window.set_visible(true);
         }
-        let presenter = SoftbufferPresenter::new(window.clone()).expect("a software presenter");
+        apply_ime(&window, self.app.ime_cursor_area());
+        let presenter: Box<dyn Presenter> = match self.presenter_factory.take() {
+            Some(factory) => factory(window.clone()).expect("the application's presenter"),
+            None => Box::new(
+                SoftbufferPresenter::new(window.clone()).expect("a software presenter"),
+            ),
+        };
         self.scale = Scale::new(window.scale_factor());
         self.app.on_scale(self.scale);
         if let Some(theme) = window.theme() {
             self.app.on_theme(theme == WinitTheme::Dark);
         }
         self.window = Some(window);
-        self.presenter = Some(Box::new(presenter));
+        self.presenter = Some(presenter);
     }
 
     /// Something arrived on a thread that is not this one.
@@ -493,7 +746,7 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Host) {
         match event {
             Host::Wake => {
-                self.app.tick();
+                self.run_tick();
                 self.request_redraw();
             }
             #[cfg(feature = "accessibility")]
@@ -550,22 +803,32 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed {
-                    return;
-                }
-                if let Some(key) = translate(&event.logical_key, event.text.as_deref()) {
-                    self.app.on_key(&key);
+                let physical = physical_label(event.physical_key);
+                if let Some(decoded) = interpret_key(
+                    &event.logical_key,
+                    event.text.as_deref(),
+                    &physical,
+                    event.state == ElementState::Pressed,
+                    event.repeat,
+                    self.modifiers,
+                ) {
+                    if decoded.pressed {
+                        self.app.on_key(&decoded.key);
+                    }
+                    self.app.on_key_event(&decoded);
+                    self.note_input();
                     self.request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                self.app.on_modifiers(Modifiers {
+                self.modifiers = Modifiers {
                     shift: state.shift_key(),
                     control: state.control_key(),
                     alt: state.alt_key(),
                     logo: state.super_key(),
-                });
+                };
+                self.app.on_modifiers(self.modifiers);
             }
             WindowEvent::ThemeChanged(theme) => {
                 self.app.on_theme(theme == WinitTheme::Dark);
@@ -590,9 +853,21 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
                     self.request_redraw();
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = scroll_pixels(delta);
-                self.app.on_scroll(dx, dy);
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                let scrolled = scroll_event(delta, phase);
+                self.app.on_scroll(scrolled.pixel_dx, scrolled.pixel_dy);
+                self.app.on_scroll_event(&scrolled);
+                self.note_input();
+                self.request_redraw();
+            }
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                self.app.on_magnify(gesture_phase(phase), delta);
+                self.note_input();
+                self.request_redraw();
+            }
+            WindowEvent::Ime(ime) => {
+                self.app.on_ime(&translate_ime(&ime));
+                self.note_input();
                 self.request_redraw();
             }
             WindowEvent::RedrawRequested => self.redraw(),
@@ -601,7 +876,8 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.app.tick();
+        self.run_tick();
+        drain_title(&mut self.app, self.window.as_deref());
         if self.app.should_exit() {
             self.app.on_exit();
             event_loop.exit();
@@ -628,9 +904,36 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     }
 }
 
+pub type PresenterFactory =
+    Box<dyn FnOnce(Arc<Window>) -> Result<Box<dyn Presenter>, PresentError>>;
+
+impl<A: PixelApp> Shell<A> {
+    fn run_tick(&mut self) {
+        let started = Instant::now();
+        self.app.tick();
+        self.pending_tick = started.elapsed();
+    }
+
+    fn note_input(&mut self) {
+        if self.input_at.is_none() {
+            self.input_at = Some(Instant::now());
+        }
+    }
+}
+
 pub fn run_app<A: PixelApp>(
     app: A,
     config: WindowConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_app_with_presenter(app, config, None)
+}
+
+/// `presenter` replaces the softbuffer default. The closure receives the
+/// window once, when it is created.
+pub fn run_app_with_presenter<A: PixelApp>(
+    app: A,
+    config: WindowConfig,
+    presenter: Option<PresenterFactory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<Host>::with_user_event().build()?;
     let mut app = app;
@@ -645,6 +948,10 @@ pub fn run_app<A: PixelApp>(
         buffer: WindowBuffer::new(1, 1),
         scale: Scale::ONE,
         timer: FrameTimer::from_env(),
+        pending_tick: Duration::ZERO,
+        input_at: None,
+        modifiers: Modifiers::default(),
+        presenter_factory: presenter,
         next_tick: None,
         #[cfg(feature = "accessibility")]
         proxy: event_loop.create_proxy(),
@@ -848,5 +1155,161 @@ mod tests {
             assert!(ctrl_only.accel());
             assert!(!logo_only.accel());
         }
+    }
+
+    struct TitleApp {
+        polls: usize,
+        pending: Option<String>,
+    }
+
+    impl PixelApp for TitleApp {
+        fn render(&mut self, _buffer: &mut WindowBuffer, _scale: Scale) {}
+
+        fn poll_title(&mut self) -> Option<String> {
+            self.polls += 1;
+            self.pending.take()
+        }
+    }
+
+    struct BareApp;
+
+    impl PixelApp for BareApp {
+        fn render(&mut self, _buffer: &mut WindowBuffer, _scale: Scale) {}
+    }
+
+    #[test]
+    fn hooks_an_app_does_not_override_are_quiet() {
+        // New trait methods must not disturb existing apps: the defaults are
+        // a no-op IME hook and no title request.
+        let mut app = BareApp;
+        app.on_ime(&ImeEvent::Commit("x".to_owned()));
+        app.on_key_event(&KeyEvent {
+            key: KeyInput::Character('a'),
+            text: "a".to_owned(),
+            physical: "KeyA".to_owned(),
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        });
+        app.on_scroll_event(&ScrollEvent {
+            pixel_dx: 0.0,
+            pixel_dy: 1.0,
+            line_dx: None,
+            line_dy: None,
+            phase: GesturePhase::Moved,
+        });
+        app.on_magnify(GesturePhase::Ended, 0.1);
+        assert!(app.ime_cursor_area().is_none());
+        assert_eq!(app.poll_title(), None);
+    }
+
+    #[test]
+    fn ime_events_all_reach_the_app_rather_than_being_dropped() {
+        assert_eq!(translate_ime(&WinitIme::Enabled), ImeEvent::Enabled);
+        assert_eq!(
+            translate_ime(&WinitIme::Preedit("あ".to_owned(), Some((3, 3)))),
+            ImeEvent::Preedit("あ".to_owned(), Some((3, 3)))
+        );
+        assert_eq!(
+            translate_ime(&WinitIme::Preedit(String::new(), None)),
+            ImeEvent::Preedit(String::new(), None),
+            "the empty preedit that clears a composition survives too"
+        );
+        assert_eq!(
+            translate_ime(&WinitIme::Commit("あ不".to_owned())),
+            ImeEvent::Commit("あ不".to_owned())
+        );
+        assert_eq!(translate_ime(&WinitIme::Disabled), ImeEvent::Disabled);
+    }
+
+    #[test]
+    fn a_title_waits_for_the_window_rather_than_being_lost() {
+        // `about_to_wait` runs before the first window exists. Asking the
+        // app then would consume a one-shot title nobody could apply.
+        let mut app = TitleApp {
+            polls: 0,
+            pending: Some("Salon \u{2014} Checkout".to_owned()),
+        };
+        drain_title(&mut app, None);
+        assert_eq!(app.polls, 0, "the app must not be asked with no window");
+        assert!(app.pending.is_some(), "the title is still there for later");
+    }
+
+    #[test]
+    fn a_title_is_one_shot() {
+        let mut app = TitleApp {
+            polls: 0,
+            pending: Some("Salon \u{2014} Checkout".to_owned()),
+        };
+        assert!(app.poll_title().is_some());
+        assert_eq!(app.poll_title(), None, "the second drain finds nothing");
+    }
+
+    #[test]
+    fn a_committed_string_is_delivered_whole_and_key_up_is_separate() {
+        let pressed = interpret_key(
+            &Key::Character(SmolStr::new("abc")),
+            Some("abc"),
+            "KeyA",
+            true,
+            false,
+            Modifiers::default(),
+        )
+        .expect("character");
+        assert_eq!(pressed.key, KeyInput::Character('a'));
+        assert_eq!(pressed.text, "abc");
+        assert!(pressed.pressed);
+
+        let released = interpret_key(
+            &Key::Character(SmolStr::new("a")),
+            Some("a"),
+            "KeyA",
+            false,
+            false,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        )
+        .expect("release");
+        assert!(!released.pressed);
+        assert!(released.text.is_empty());
+        assert!(released.modifiers.shift);
+        assert_eq!(released.physical, "KeyA");
+    }
+
+    #[test]
+    fn function_keys_cover_the_whole_range() {
+        assert_eq!(
+            translate(&Key::Named(NamedKey::F13), None),
+            Some(KeyInput::Function(13))
+        );
+        assert_eq!(
+            translate(&Key::Named(NamedKey::F24), None),
+            Some(KeyInput::Function(24))
+        );
+        assert_eq!(
+            translate(&Key::Named(NamedKey::F6), None),
+            Some(KeyInput::Function(6))
+        );
+    }
+
+    #[test]
+    fn scroll_keeps_line_deltas_and_forwards_the_phase() {
+        let lines = scroll_event(MouseScrollDelta::LineDelta(1.0, -2.0), TouchPhase::Ended);
+        assert_eq!(lines.line_dx, Some(1.0));
+        assert_eq!(lines.line_dy, Some(-2.0));
+        assert_eq!(lines.pixel_dy, -2.0 * PIXELS_PER_LINE);
+        assert_eq!(lines.phase, GesturePhase::Ended);
+
+        let pixels = scroll_event(
+            MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(4.0, 5.0)),
+            TouchPhase::Moved,
+        );
+        assert_eq!(pixels.line_dx, None);
+        assert_eq!((pixels.pixel_dx, pixels.pixel_dy), (4.0, 5.0));
+        assert_eq!(pixels.phase, GesturePhase::Moved);
+        assert_eq!(gesture_phase(TouchPhase::Cancelled), GesturePhase::Cancelled);
+        assert_eq!(gesture_phase(TouchPhase::Started), GesturePhase::Started);
     }
 }
