@@ -989,6 +989,11 @@ mod tests {
 pub struct TextFieldState {
     text: String,
     caret: usize,
+    /// The other end of a selection, when one exists: the range is
+    /// `anchor..caret`, normalised. `None` is the overwhelmingly common
+    /// case — every caret move and every edit clears it — so unselected
+    /// fields behave exactly as before.
+    selection_anchor: Option<usize>,
 }
 
 impl TextFieldState {
@@ -1001,6 +1006,7 @@ impl TextFieldState {
         TextFieldState {
             caret: text.len(),
             text,
+            selection_anchor: None,
         }
     }
 
@@ -1019,11 +1025,73 @@ impl TextFieldState {
     pub fn clear(&mut self) {
         self.text.clear();
         self.caret = 0;
+        self.selection_anchor = None;
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.caret = self.text.len();
+        self.selection_anchor = None;
+    }
+
+    /// Select everything, for copy-out or type-over. The caret moves to the
+    /// end, matching a native field; [`TextFieldState::clear_selection`]
+    /// drops it again.
+    pub fn select_all(&mut self) {
+        self.selection_anchor = Some(0);
+        self.caret = self.text.len();
+    }
+
+    /// Drop the selection, keeping caret and text.
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// The selected byte range, ordered, while a selection exists — `None`
+    /// once it is dropped. An empty range (select-all of an empty field)
+    /// still reports `Some((n, n))`; use [`TextFieldState::has_selection`]
+    /// to ask whether anything is actually selected.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_anchor.map(|anchor| {
+            if anchor < self.caret {
+                (anchor, self.caret)
+            } else {
+                (self.caret, anchor)
+            }
+        })
+    }
+
+    /// Whether any text is selected: a range exists and is non-empty.
+    pub fn has_selection(&self) -> bool {
+        self.selection_range()
+            .is_some_and(|(start, end)| start != end)
+    }
+
+    /// The selected text, or `None` when nothing is selected.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection_range()
+            .filter(|(start, end)| start != end)
+            .map(|(start, end)| &self.text[start..end])
+    }
+
+    /// Remove the selected text, leaving the caret at its start. Returns
+    /// whether text was removed. Always drops the selection, even an empty
+    /// one, so every edit below can call it unconditionally.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some(anchor) = self.selection_anchor.take() else {
+            return false;
+        };
+        let (start, end) = if anchor < self.caret {
+            (anchor, self.caret)
+        } else {
+            (self.caret, anchor)
+        };
+        self.caret = start;
+        if start == end {
+            return false;
+        }
+        self.text.replace_range(start..end, "");
+        true
     }
 
     /// The start of the cluster containing `at`: back off any combining marks.
@@ -1060,6 +1128,7 @@ impl TextFieldState {
     }
 
     pub fn move_left(&mut self) {
+        self.clear_selection();
         if self.caret == 0 {
             return;
         }
@@ -1073,6 +1142,7 @@ impl TextFieldState {
     }
 
     pub fn move_right(&mut self) {
+        self.clear_selection();
         if self.caret >= self.text.len() {
             return;
         }
@@ -1080,20 +1150,36 @@ impl TextFieldState {
     }
 
     pub fn home(&mut self) {
+        self.clear_selection();
         self.caret = 0;
     }
 
     pub fn end(&mut self) {
+        self.clear_selection();
         self.caret = self.text.len();
     }
 
     pub fn insert(&mut self, character: char) {
+        self.delete_selection();
         self.text.insert(self.caret, character);
         self.caret += character.len_utf8();
     }
 
-    /// Delete backwards — the whole cluster, base and marks together.
+    /// Insert a whole string — what an IME `Commit` delivers — replacing any
+    /// selection first, exactly as single-character [`TextFieldState::insert`]
+    /// does. The caret lands after the inserted text.
+    pub fn insert_str(&mut self, text: &str) {
+        self.delete_selection();
+        self.text.insert_str(self.caret, text);
+        self.caret += text.len();
+    }
+
+    /// Delete backwards — the selection if there is one, otherwise the
+    /// whole cluster, base and marks together.
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.caret == 0 {
             return;
         }
@@ -1108,8 +1194,12 @@ impl TextFieldState {
         self.caret = start;
     }
 
-    /// Delete forwards, likewise a whole cluster.
+    /// Delete forwards — the selection if there is one, otherwise a
+    /// whole cluster, likewise.
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.caret >= self.text.len() {
             return;
         }
@@ -1126,11 +1216,11 @@ impl TextFieldState {
                     self.insert(*character);
                     changed = true;
                 }
-                KeyInput::Backspace if self.caret > 0 => {
+                KeyInput::Backspace if self.caret > 0 || self.has_selection() => {
                     self.backspace();
                     changed = true;
                 }
-                KeyInput::Delete if self.caret < self.text.len() => {
+                KeyInput::Delete if self.caret < self.text.len() || self.has_selection() => {
                     self.delete();
                     changed = true;
                 }
@@ -1212,6 +1302,20 @@ impl Ui<'_> {
         }
 
         if focused {
+            // A selected range reads as a highlight, measured the same way
+            // as the caret below. Ranges only ever span whole clusters —
+            // the caret and the anchor never land inside one — so slicing
+            // by these byte offsets is sound.
+            if let Some((start, end)) = state.selection_range() {
+                if start != end {
+                    let x0 = inner.x + self.text.measure(&state.text()[..start], theme.body);
+                    let width = self.text.measure(&state.text()[start..end], theme.body);
+                    let height = self.text.line_height(theme.body);
+                    let top = inner.y + (inner.h - height) / 2;
+                    self.painter
+                        .fill_rect(Rect::new(x0, top, width, height), theme.selection);
+                }
+            }
             // A caret drawn at the measured width of the text before it, so
             // it sits where the next glyph will land rather than at a guess.
             // Masked, that means the width of *its* dots, not of the real
@@ -1425,6 +1529,106 @@ mod text_field_tests {
         field.delete();
         assert!(field.is_empty());
         assert_eq!(field.caret(), 0);
+    }
+
+    #[test]
+    fn select_all_reports_the_whole_text() {
+        let mut field = TextFieldState::with_text("ข้าว");
+        assert_eq!(field.selected_text(), None, "nothing selected yet");
+        field.select_all();
+        assert!(field.has_selection());
+        assert_eq!(field.selected_text(), Some("ข้าว"));
+        assert_eq!(field.selection_range(), Some((0, "ข้าว".len())));
+        assert_eq!(
+            field.caret(),
+            "ข้าว".len(),
+            "caret to the end, like a native field"
+        );
+    }
+
+    #[test]
+    fn select_all_of_an_empty_field_selects_nothing() {
+        let mut field = TextFieldState::new();
+        field.select_all();
+        assert!(!field.has_selection());
+        assert_eq!(field.selected_text(), None);
+        field.backspace();
+        assert!(field.is_empty(), "still harmless");
+    }
+
+    #[test]
+    fn clear_selection_drops_it_without_moving_the_caret() {
+        let mut field = TextFieldState::with_text("rice");
+        field.select_all();
+        field.clear_selection();
+        assert!(!field.has_selection());
+        assert_eq!(field.selected_text(), None);
+        assert_eq!(field.selection_range(), None);
+        assert_eq!(field.text(), "rice");
+        assert_eq!(field.caret(), 4);
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        let mut field = TextFieldState::with_text("ac");
+        field.select_all();
+        field.insert('b');
+        assert_eq!(field.text(), "b");
+        assert_eq!(field.caret(), 1);
+        assert!(!field.has_selection(), "the edit consumed the selection");
+    }
+
+    #[test]
+    fn committing_a_string_over_a_selection_replaces_it() {
+        // What an IME Commit delivers: several characters at once.
+        let mut field = TextFieldState::with_text("ac");
+        field.select_all();
+        field.insert_str("あ不");
+        assert_eq!(field.text(), "あ不");
+        assert_eq!(field.caret(), "あ不".len());
+    }
+
+    #[test]
+    fn backspace_with_a_selection_deletes_the_range() {
+        let mut field = TextFieldState::with_text("น้ำดี");
+        field.select_all();
+        field.backspace();
+        assert_eq!(field.text(), "");
+        assert_eq!(field.caret(), 0);
+    }
+
+    #[test]
+    fn delete_with_a_selection_deletes_the_range() {
+        let mut field = TextFieldState::with_text("ab");
+        field.select_all();
+        field.delete();
+        assert_eq!(field.text(), "");
+        assert_eq!(field.caret(), 0);
+    }
+
+    #[test]
+    fn moving_the_caret_drops_the_selection() {
+        let mut field = TextFieldState::with_text("rice");
+        field.select_all();
+        field.move_left();
+        assert!(!field.has_selection());
+        field.select_all();
+        field.home();
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 0);
+    }
+
+    #[test]
+    fn plain_edits_leave_no_selection_behind() {
+        // The caret semantics existing callers rely on, stated outright:
+        // without select_all there is never a selection to trip over.
+        let mut field = TextFieldState::with_text("ac");
+        field.move_left();
+        field.insert('b');
+        field.backspace();
+        assert_eq!(field.text(), "ac");
+        assert!(!field.has_selection());
+        assert_eq!(field.caret(), 1);
     }
 }
 
