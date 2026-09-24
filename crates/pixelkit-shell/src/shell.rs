@@ -728,14 +728,6 @@ fn translate_button(button: WinitButton) -> Option<MouseButton> {
     }
 }
 
-/// Wheel movement in pixels, whichever way the platform reports it.
-fn scroll_pixels(delta: MouseScrollDelta) -> (f32, f32) {
-    match delta {
-        MouseScrollDelta::LineDelta(x, y) => (x * PIXELS_PER_LINE, y * PIXELS_PER_LINE),
-        MouseScrollDelta::PixelDelta(position) => (position.x as f32, position.y as f32),
-    }
-}
-
 impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -1118,23 +1110,6 @@ mod tests {
         );
         assert_eq!(translate_button(WinitButton::Back), None);
         assert_eq!(translate_button(WinitButton::Other(9)), None);
-    }
-
-    #[test]
-    fn scrolling_is_pixels_however_the_platform_reports_it() {
-        // X11 and Wayland report lines; a trackpad reports pixels. A widget
-        // that had to know which would scroll at two different speeds.
-        let (_, lines) = scroll_pixels(MouseScrollDelta::LineDelta(0.0, -2.0));
-        assert_eq!(lines, -2.0 * PIXELS_PER_LINE);
-
-        let (dx, dy) = scroll_pixels(MouseScrollDelta::PixelDelta(
-            winit::dpi::PhysicalPosition::new(3.0, -7.5),
-        ));
-        assert_eq!((dx, dy), (3.0, -7.5));
-
-        // Both directions survive, so a wide table can scroll sideways.
-        let (dx, _) = scroll_pixels(MouseScrollDelta::LineDelta(1.0, 0.0));
-        assert_eq!(dx, PIXELS_PER_LINE);
     }
 
     #[test]
