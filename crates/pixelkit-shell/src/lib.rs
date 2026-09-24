@@ -20,6 +20,7 @@ pub use platform::{beep, system_accent};
 pub use present::{PresentError, Presenter, PresenterBackend, SoftbufferPresenter};
 pub use scale::Scale;
 pub use shell::{
-    run_app, run_app_with_presenter, GesturePhase, ImeCursorArea, ImeEvent, KeyEvent, KeyInput,
-    Modifiers, MouseButton, PixelApp, PresenterFactory, ScrollEvent, Wake, Waker, WindowConfig,
+    run_app, run_app_with_presenter, CursorShape, GesturePhase, ImeCursorArea, ImeEvent, KeyEvent,
+    KeyInput, Modifiers, MouseButton, PixelApp, PresenterFactory, ScrollEvent, Wake, Waker,
+    WindowConfig,
 };

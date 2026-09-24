@@ -253,6 +253,19 @@ pub trait PixelApp {
         None
     }
 
+    /// A change of full-screen state the application wants. Polled like
+    /// [`PixelApp::poll_title`]: return `Some(true)` once to enter borderless
+    /// full screen on the current monitor, `Some(false)` once to leave it.
+    fn poll_fullscreen(&mut self) -> Option<bool> {
+        None
+    }
+
+    /// The pointer shape the application wants over its window now. Polled
+    /// after input; the shell only touches the window when it changes.
+    fn cursor_shape(&self) -> CursorShape {
+        CursorShape::Default
+    }
+
     fn on_exit(&mut self) {}
 
     /// The modifier state changed. Delivered separately from the keys it
@@ -376,6 +389,8 @@ struct Shell<A: PixelApp> {
     /// When the next unprompted repaint is due, for an app that asked for an
     /// interval. `None` until the first one is scheduled.
     next_tick: Option<Instant>,
+    /// The pointer shape last set on the window.
+    cursor_shape: CursorShape,
     #[cfg(feature = "accessibility")]
     proxy: EventLoopProxy<Host>,
     #[cfg(feature = "accessibility")]
@@ -416,11 +431,18 @@ impl<A: PixelApp> Shell<A> {
         let painted = Instant::now();
         let _ = presenter.present(&self.buffer);
         let presented = Instant::now();
-        let input_to_present = self.input_at.take().map(|at| presented.saturating_duration_since(at));
+        let input_to_present = self
+            .input_at
+            .take()
+            .map(|at| presented.saturating_duration_since(at));
         let tick = self.pending_tick;
         self.pending_tick = Duration::ZERO;
-        self.timer
-            .record_full(tick, painted - started, presented - painted, input_to_present);
+        self.timer.record_full(
+            tick,
+            painted - started,
+            presented - painted,
+            input_to_present,
+        );
         // After the present, so a screen reader is never told about a frame
         // the eyes cannot see yet.
         self.publish_accessibility();
@@ -640,6 +662,38 @@ fn drain_title<A: PixelApp>(app: &mut A, window: Option<&Window>) {
     }
 }
 
+/// Apply a full-screen request and a pointer-shape change, if any.
+fn drain_window_state<A: PixelApp>(app: &mut A, window: Option<&Window>, shape: &mut CursorShape) {
+    let Some(window) = window else { return };
+    if let Some(full) = app.poll_fullscreen() {
+        window.set_fullscreen(full.then_some(winit::window::Fullscreen::Borderless(None)));
+    }
+    let wanted = app.cursor_shape();
+    if wanted != *shape {
+        *shape = wanted;
+        window.set_cursor(match wanted {
+            CursorShape::Default => winit::window::CursorIcon::Default,
+            CursorShape::Text => winit::window::CursorIcon::Text,
+            CursorShape::Pointer => winit::window::CursorIcon::Pointer,
+            CursorShape::ResizeHorizontal => winit::window::CursorIcon::ColResize,
+        });
+    }
+}
+
+/// Pointer shapes an application can ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    /// The platform arrow.
+    #[default]
+    Default,
+    /// An I-beam over editable text.
+    Text,
+    /// A hand over something clickable.
+    Pointer,
+    /// A left-right arrow over a draggable vertical edge.
+    ResizeHorizontal,
+}
+
 /// Whether an interval-driven repaint is due, and when the next one is.
 ///
 /// Split out from the event loop because getting it wrong does not look like a
@@ -724,9 +778,9 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
         apply_ime(&window, self.app.ime_cursor_area());
         let presenter: Box<dyn Presenter> = match self.presenter_factory.take() {
             Some(factory) => factory(window.clone()).expect("the application's presenter"),
-            None => Box::new(
-                SoftbufferPresenter::new(window.clone()).expect("a software presenter"),
-            ),
+            None => {
+                Box::new(SoftbufferPresenter::new(window.clone()).expect("a software presenter"))
+            }
         };
         self.scale = Scale::new(window.scale_factor());
         self.app.on_scale(self.scale);
@@ -878,6 +932,11 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.run_tick();
         drain_title(&mut self.app, self.window.as_deref());
+        drain_window_state(
+            &mut self.app,
+            self.window.as_deref(),
+            &mut self.cursor_shape,
+        );
         if self.app.should_exit() {
             self.app.on_exit();
             event_loop.exit();
@@ -953,6 +1012,7 @@ pub fn run_app_with_presenter<A: PixelApp>(
         modifiers: Modifiers::default(),
         presenter_factory: presenter,
         next_tick: None,
+        cursor_shape: CursorShape::Default,
         #[cfg(feature = "accessibility")]
         proxy: event_loop.create_proxy(),
         #[cfg(feature = "accessibility")]
@@ -1309,7 +1369,10 @@ mod tests {
         assert_eq!(pixels.line_dx, None);
         assert_eq!((pixels.pixel_dx, pixels.pixel_dy), (4.0, 5.0));
         assert_eq!(pixels.phase, GesturePhase::Moved);
-        assert_eq!(gesture_phase(TouchPhase::Cancelled), GesturePhase::Cancelled);
+        assert_eq!(
+            gesture_phase(TouchPhase::Cancelled),
+            GesturePhase::Cancelled
+        );
         assert_eq!(gesture_phase(TouchPhase::Started), GesturePhase::Started);
     }
 }
