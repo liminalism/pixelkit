@@ -26,3 +26,13 @@ unsafe_code = "forbid"
 
 [profile.release]
 debug = true
+
+[profile.debug-release]
+inherits = "release"
+lto = false
+debug = 1
+
+[profile.release-final]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
