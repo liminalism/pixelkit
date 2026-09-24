@@ -1,0 +1,26 @@
+akr 0.1
+project pixelkit
+
+record pixelkit.evidence.coverage-simd-profile/1 : evidence {
+    title "On this aarch64 Mac, median ns/row scalar versus dispatched path were 0.78/1.00 at 8 bytes, 1.50/1.75 at 32, 4.51/4.49 at 256, and 50.45/49.24 at 4096. Only the 4096-byte row selects explicit SIMD; its small gain needs confirmation on other machines."
+    state verified
+    result inconclusive
+    method command
+    observed_at git:718f24963421420813032eef7305ad2114f78297
+    command "cargo run -p pixelkit-raster --release --example max_span_profile --offline"
+    summary """
+        On this aarch64 Mac, median ns/row scalar versus dispatched path were 0.78/1.00 at 8 bytes, 1.50/1.75 at 32, 4.51/4.49 at 256, and 50.45/49.24 at 4096. Only the 4096-byte row selects explicit SIMD; its small gain needs confirmation on other machines.
+        """
+}
+
+record pixelkit.evidence.coverage-simd-tests/1 : evidence {
+    title "116 raster tests passed after the u8x32 merge and the 1024-byte dispatch threshold, including clipped spans and boundary lengths."
+    state verified
+    result pass
+    method command
+    observed_at git:718f24963421420813032eef7305ad2114f78297
+    command "cargo test -p pixelkit-raster --offline --quiet"
+    summary """
+        116 raster tests passed after the u8x32 merge and the 1024-byte dispatch threshold, including clipped spans and boundary lengths.
+        """
+}
