@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pixelkit-raster",
+    "crates/pixelkit-text",
+    "crates/pixelkit-shell",
+    "crates/pixelkit-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+pixelkit-raster = { path = "crates/pixelkit-raster" }
+pixelkit-text = { path = "crates/pixelkit-text" }
+pixelkit-shell = { path = "crates/pixelkit-shell" }
+pixelkit-ui = { path = "crates/pixelkit-ui" }
+winit = "0.30"
+softbuffer = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+debug = true
+
+[profile.debug-release]
+inherits = "release"
+lto = false
+debug = 1
+
+[profile.release-final]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
