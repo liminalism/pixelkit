@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+wide = "0.7.33"
 
 [lints]
 workspace = true

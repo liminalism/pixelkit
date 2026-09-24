@@ -1,5 +1,4 @@
-//! The portable implementations — and the definition of what the vector
-//! kernels have to produce.
+//! Exact portable blend arithmetic and a vector coverage merge.
 //!
 //! These are not "the slow path". They are the specification: every other
 //! backend is asserted byte-for-byte identical to what is here, over exhaustive
@@ -7,6 +6,8 @@
 //! would show up as a faint fringe on every glyph edge, or a dot that prints on
 //! one machine and not another — the kind of difference nobody attributes to
 //! arithmetic.
+
+use wide::u8x32;
 
 /// Integer blend in sRGB space, weights summing to 256.
 ///
@@ -62,10 +63,33 @@ pub fn blend_coverage_span(destination: &mut [u32], color: u32, coverage: &[u8])
 /// dark seam where they meet.
 #[inline]
 pub fn max_span(destination: &mut [u8], source: &[u8]) {
-    for (slot, &cover) in destination.iter_mut().zip(source) {
-        if cover > *slot {
-            *slot = cover;
+    let len = destination.len().min(source.len());
+    // Scalar code is already auto-vectorized on short glyph spans. Keep the
+    // explicit wide path on larger coverage buffers to avoid call overhead.
+    if len < 1024 {
+        for (slot, &cover) in destination.iter_mut().zip(source) {
+            *slot = (*slot).max(cover);
         }
+        return;
+    }
+    let (destination, source) = (&mut destination[..len], &source[..len]);
+    let mut chunks = destination
+        .chunks_exact_mut(32)
+        .zip(source.chunks_exact(32));
+    for (dst, src) in &mut chunks {
+        let mut dst_array = [0u8; 32];
+        let mut src_array = [0u8; 32];
+        dst_array.copy_from_slice(dst);
+        src_array.copy_from_slice(src);
+        dst.copy_from_slice(
+            &u8x32::from(dst_array)
+                .max(u8x32::from(src_array))
+                .to_array(),
+        );
+    }
+    let offset = len - len % 32;
+    for (slot, &cover) in destination[offset..].iter_mut().zip(&source[offset..]) {
+        *slot = (*slot).max(cover);
     }
 }
 
@@ -96,6 +120,46 @@ pub fn all_zero(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_max_matches_scalar_for_clipped_and_unaligned_spans() {
+        for dst_len in 0..65 {
+            for src_len in 0..65 {
+                let mut actual = (0..dst_len)
+                    .map(|i| (i * 37 + 11) as u8)
+                    .collect::<Vec<_>>();
+                let source = (0..src_len)
+                    .map(|i| (i * 53 + 197) as u8)
+                    .collect::<Vec<_>>();
+                let mut expected = actual.clone();
+                for (slot, &cover) in expected.iter_mut().zip(&source) {
+                    *slot = (*slot).max(cover);
+                }
+                max_span(&mut actual, &source);
+                assert_eq!(actual, expected, "dst={dst_len}, src={src_len}");
+            }
+        }
+    }
+
+    #[test]
+    fn vector_max_matches_scalar_across_dispatch_boundary() {
+        for dst_len in [1023, 1024, 1025, 2048, 4097] {
+            for src_len in [1023, 1024, 1025, 2048, 4097] {
+                let mut actual = (0..dst_len)
+                    .map(|index| (index * 37 + 11) as u8)
+                    .collect::<Vec<_>>();
+                let source = (0..src_len)
+                    .map(|index| (index * 53 + 197) as u8)
+                    .collect::<Vec<_>>();
+                let mut expected = actual.clone();
+                for (slot, &cover) in expected.iter_mut().zip(&source) {
+                    *slot = (*slot).max(cover);
+                }
+                max_span(&mut actual, &source);
+                assert_eq!(actual, expected, "dst={dst_len}, src={src_len}");
+            }
+        }
+    }
 
     #[test]
     fn blending_a_colour_over_itself_changes_nothing() {

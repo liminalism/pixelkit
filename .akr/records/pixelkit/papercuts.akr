@@ -1,0 +1,13 @@
+akr 0.1
+project pixelkit
+
+record pixelkit.papercut.during-the-first-pixelkit-planning-lookup-akr/1 : papercut {
+    title "During the first PixelKit planning lookup, akr start failed while…"
+    state verified
+    statement """
+        During the first PixelKit planning lookup, akr start failed while opening its FTS5 cache; retrying later succeeded without source changes. The cache recovery path or diagnostic could be clearer.
+        """
+    observed_at git:7492c49a204321cd3abea7ad0fe1433aa63362ca
+    author "codex"
+    created_at 2026-09-24
+}

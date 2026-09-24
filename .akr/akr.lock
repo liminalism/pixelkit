@@ -2,14 +2,28 @@ akr-lock 0.1
 project pixelkit
 
 build {
-    tool "akr 0.5.0"
+    tool "akr 0.5.1"
     grammar "0.1"
     vocabulary "0.2"
-    commit git:8c5634f8f03bcc6af9e1382864ab43c68706fe7a
-    source_graph "sha256:57f4a60dc77e073dd5017490c89c1690b9e70e7581d5b984fe6096635be2c72d"
+    source_graph "sha256:311cd6352d6143be2303bf67aade985adc4341e2d344e8c7f82857a756f08b80"
 }
 
 source ".akr/project.akr" {
     hash "sha256:760581ce3b39bf108f136c62467eb9be4f93a45212041c440dcb7301e2cce2fa"
     records 0
+}
+
+source ".akr/records/pixelkit/papercuts.akr" {
+    hash "sha256:6d3797a47d968330113294641933325ae9d8520f2c9c8330eb5274e0188b33df"
+    records 1
+}
+
+source ".akr/records/pixelkit/work.akr" {
+    hash "sha256:98d05fcc0c4fe9abe1e64954b08e72593a51a72d3116296bcb4efd99f42078d5"
+    records 1
+}
+
+seal @pixelkit.papercut.during-the-first-pixelkit-planning-lookup-akr/1 {
+    state verified
+    hash "sha256:e968eba153f8a82e41bc3f364b402ae7bbd305e61633d951576931bff9036d18"
 }

@@ -1,0 +1,16 @@
+akr 0.1
+project pixelkit
+
+record pixelkit.work.raster-simd-coverage/1 : work {
+    title "Measured exact SIMD coverage in raster kernels"
+    state proposed
+    intent """
+        Keep coverage merging bit exact while adding SIMD only where profiles
+        justify it. The initial u8x32 path handles rows of at least 1024 bytes;
+        shorter glyph spans retain the scalar loop. Compare scalar and vector
+        medians for short and long rows on aarch64 and x86_64, then expand to
+        alpha coverage blending or opaque bitmap rows only after equivalent
+        output and a measured speed benefit. Preserve clipped tails and portable
+        behavior on unsupported targets.
+        """
+}
