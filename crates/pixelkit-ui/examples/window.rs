@@ -5,10 +5,11 @@
 //! ```
 
 use pixelkit_raster::{Painter, RasterKernel, Rect, WindowBuffer};
-use pixelkit_shell::{run_app, Input, KeyInput, MouseButton, PixelApp, Scale, WindowConfig};
+use pixelkit_shell::{Input, KeyInput, MouseButton, Scale};
 use pixelkit_text::font::test_fonts::{set, LATIN};
 use pixelkit_text::{Align, TextCache, TextStyle};
 use pixelkit_ui::{ButtonStyle, ScrollState, Theme, Ui};
+use pixelkit_windowing::{run_app, PixelApp, WindowConfig};
 
 struct Demo {
     text: TextCache,

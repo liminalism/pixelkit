@@ -5,7 +5,7 @@ build {
     tool "akr 0.5.1"
     grammar "0.1"
     vocabulary "0.2"
-    source_graph "sha256:f031013a08b67aad8addae95c12ab4d9be89c0dc0d911a9a6e87e326763bc3ef"
+    source_graph "sha256:db756944e491b43fa10d7de3b53dd5dcf0e859296d29eded93e53ae04be52c21"
 }
 
 source ".akr/project.akr" {
@@ -14,8 +14,8 @@ source ".akr/project.akr" {
 }
 
 source ".akr/records/pixelkit/evidence.akr" {
-    hash "sha256:20402f694517211d64e497ef7b39958e80d1a1dc2043f6eed6b9c69944b7c9f3"
-    records 2
+    hash "sha256:d72180109356ddeb3cf5e96823e7711673dcf99dc2394b7a22349ec4d903a642"
+    records 4
 }
 
 source ".akr/records/pixelkit/papercuts.akr" {
@@ -24,8 +24,8 @@ source ".akr/records/pixelkit/papercuts.akr" {
 }
 
 source ".akr/records/pixelkit/work.akr" {
-    hash "sha256:98d05fcc0c4fe9abe1e64954b08e72593a51a72d3116296bcb4efd99f42078d5"
-    records 1
+    hash "sha256:b8b79d091a3cfbd9a8347d3aa7a4e43b83a1f6cf50b55c153cbe9cec47e8b675"
+    records 2
 }
 
 seal @pixelkit.evidence.coverage-simd-profile/1 {
@@ -38,7 +38,22 @@ seal @pixelkit.evidence.coverage-simd-tests/1 {
     hash "sha256:112faae8aa88726b45a4afce0614748814c36037be2fd12e2c033d5a9523b9c8"
 }
 
+seal @pixelkit.evidence.windowing-live/1 {
+    state verified
+    hash "sha256:3d65c97b5cd2890d17ea35c5567aa5172142f8d5ee3e71d44f1e131970d27fb2"
+}
+
+seal @pixelkit.evidence.windowing-tests/1 {
+    state verified
+    hash "sha256:e4093c7277ffed9e41a58c0a874a0613cd287a42e0992b9a4a15772499f82b4d"
+}
+
 seal @pixelkit.papercut.during-the-first-pixelkit-planning-lookup-akr/1 {
     state verified
     hash "sha256:e968eba153f8a82e41bc3f364b402ae7bbd305e61633d951576931bff9036d18"
+}
+
+seal @pixelkit.work.windowing-crate/1 {
+    state completed
+    hash "sha256:17c664527242acd8121fef22810c989b65306248f2c8efa8f6fd4fc30ead4ff7"
 }

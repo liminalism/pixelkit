@@ -14,6 +14,8 @@ its history lives in the source repository:
 | `pixelkit-text/src/{font,text}.rs` | `thai-text`, generalised from two embedded faces to `Face::from_bytes` + `FontSet`, with letter-spacing added |
 | `pixelkit-text/src/cache.rs` | `pos-client-ui/src/text.rs`, keyed by `TextStyle` |
 | `pixelkit-text/test-fonts/` | Noto Sans / Noto Sans Thai (OFL 1.1), test fixtures and examples only |
-| `pixelkit-shell/src/{shell,input}.rs` | `pos-client-ui/src/{shell,input}.rs`, with HiDPI scale tracking and the `Presenter` seam added; the seam follows `Lege-ecosystem/lege-viewer/src/present/mod.rs` |
+| `pixelkit-shell/src/input.rs` | `pos-client-ui/src/input.rs` |
+| `pixelkit-windowing/src/host.rs` | `pos-client-ui/src/shell.rs` via `pixelkit-shell/src/shell.rs`, with HiDPI scale tracking and the `Presenter` seam added; the seam follows `Lege-ecosystem/lege-viewer/src/present/mod.rs` |
+| `pixelkit-windowing/src/{panes,windows}.rs` | new |
 | `pixelkit-ui/src/widget.rs` | `pos-client-ui/src/widget.rs` minus the recipe card |
 | `pixelkit-ui/src/{chrome,list,tooltip}.rs` | new |

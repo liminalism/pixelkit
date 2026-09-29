@@ -5,6 +5,7 @@ members = [
     "crates/pixelkit-text",
     "crates/pixelkit-shell",
     "crates/pixelkit-ui",
+    "crates/pixelkit-windowing",
 ]
 
 [workspace.package]
@@ -18,6 +19,7 @@ pixelkit-raster = { path = "crates/pixelkit-raster" }
 pixelkit-text = { path = "crates/pixelkit-text" }
 pixelkit-shell = { path = "crates/pixelkit-shell" }
 pixelkit-ui = { path = "crates/pixelkit-ui" }
+pixelkit-windowing = { path = "crates/pixelkit-windowing" }
 winit = "0.30"
 softbuffer = "0.4"
 

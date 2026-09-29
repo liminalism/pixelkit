@@ -1,4 +1,4 @@
-//! A winit host: owns the window and the pixel buffer, forwards input,
+//! A winit host: owns the windows and their pixel buffers, forwards input,
 //! tracks the scale factor, paces redraws, and presents through a
 //! [`Presenter`].
 //!
@@ -13,11 +13,24 @@
 //! the buttons, the wheel and the modifier keys. Every one of those arrives
 //! through a defaulted trait method, which is what keeps the counter client
 //! from having to know they exist.
+//!
+//! [`run_app`] runs one window; [`run_windows`] runs several, each with its
+//! own application, buffer and presenter, all sharing one event loop. Either
+//! way every window behaves like the single one always did — the multi-window
+//! host is the same loop over a list of slots, not a second implementation.
+//!
+//! Provenance: `pos-client-ui::shell` (restaurant-pos), with HiDPI and the
+//! presenter seam added; see `ATTRIBUTION.md`. Moved here from
+//! `pixelkit-shell` when the crate grew panes and windows.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pixelkit_raster::WindowBuffer;
+use pixelkit_shell::{
+    FrameTimer, KeyInput, Modifiers, MouseButton, PresentError, Presenter, Scale,
+    SoftbufferPresenter,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -27,14 +40,10 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey, PhysicalKey};
-use winit::window::{Theme as WinitTheme, Window, WindowId};
+use winit::window::{Theme as WinitTheme, Window, WindowId as WinitWindowId};
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
-
-use crate::frame_log::FrameTimer;
-use crate::present::{PresentError, Presenter, SoftbufferPresenter};
-use crate::scale::Scale;
 
 /// What arrives on the event loop's user channel: a wake, and, with the
 /// `accessibility` feature, a request from assistive technology.
@@ -52,7 +61,7 @@ impl From<accesskit_winit::Event> for Host {
     }
 }
 
-/// A handle that wakes the window from another thread.
+/// A handle that wakes the windows from another thread.
 ///
 /// The reason this exists is latency. Without it a client that receives its
 /// state over a socket has only one way to notice something arrived: ask on a
@@ -64,8 +73,8 @@ impl From<accesskit_winit::Event> for Host {
 /// Waking on arrival removes both at once: the redraw happens when there is
 /// something new to draw, and an idle terminal sleeps.
 ///
-/// Cloneable and `Send`, so the socket thread keeps one. Waking a window that
-/// has already closed is a no-op rather than an error — a snapshot arriving
+/// Cloneable and `Send`, so the socket thread keeps one. Waking windows that
+/// have already closed is a no-op rather than an error — a snapshot arriving
 /// during shutdown is ordinary, not exceptional.
 #[derive(Debug, Clone)]
 pub struct Waker {
@@ -85,7 +94,7 @@ impl Waker {
         Waker { proxy: None }
     }
 
-    /// Ask the window to run a tick and repaint as soon as it can.
+    /// Ask the windows to run a tick and repaint as soon as they can.
     pub fn wake(&self) {
         if let Some(proxy) = &self.proxy {
             let _ = proxy.send_event(Host::Wake);
@@ -96,29 +105,6 @@ impl Waker {
 /// A wheel notch, in pixels. Platforms that report scrolling in lines rather
 /// than pixels get multiplied by this to land somewhere comfortable.
 const PIXELS_PER_LINE: f32 = 24.0;
-
-/// A key the host recognised, as the application sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyInput {
-    /// A printable character, already normalised — numpad and top-row digits
-    /// arrive identically, because a cashier should not have to care.
-    Character(char),
-    Enter,
-    Escape,
-    Backspace,
-    /// A function key, by number.
-    Function(u8),
-    Left,
-    Right,
-    Up,
-    Down,
-    Tab,
-    Delete,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-}
 
 /// One key transition, including release, the whole committed string, and the
 /// physical key. [`PixelApp::on_key`] still receives presses only, as the
@@ -164,44 +150,6 @@ pub struct ImeCursorArea {
     pub y: f64,
     pub width: f64,
     pub height: f64,
-}
-
-/// Which modifiers were held when an event arrived.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Modifiers {
-    pub shift: bool,
-    pub control: bool,
-    pub alt: bool,
-    /// Cmd on macOS, the Windows/Super key elsewhere. Named `logo` after
-    /// winit's own `super_key()`, since "super" reads as a privilege level
-    /// to most of this codebase's readers.
-    pub logo: bool,
-}
-
-impl Modifiers {
-    /// Nothing held. The common case, and worth naming so a caller reads as
-    /// "a plain click" rather than "no modifiers".
-    pub fn none(self) -> bool {
-        !self.shift && !self.control && !self.alt && !self.logo
-    }
-
-    /// The platform's accelerator modifier for a keyboard shortcut: Cmd on
-    /// macOS, Ctrl everywhere else. A screen wiring up ⌘N/Ctrl+N checks this
-    /// instead of `control` so the shortcut is right on both platforms.
-    pub fn accel(self) -> bool {
-        if cfg!(target_os = "macos") {
-            self.logo
-        } else {
-            self.control
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseButton {
-    Left,
-    Right,
-    Middle,
 }
 
 pub trait PixelApp {
@@ -260,6 +208,17 @@ pub trait PixelApp {
         None
     }
 
+    /// Open another OS window, or close this one. Drained every frame, so an
+    /// application that wants two windows returns `Some` twice (usually across
+    /// two frames, one-shot like [`PixelApp::poll_title`]); the host keeps
+    /// draining until it sees `None`.
+    ///
+    /// A window that closes itself and opens another in the same drain
+    /// replaces itself: the close removes only the window that asked.
+    fn poll_window(&mut self) -> Option<WindowRequest> {
+        None
+    }
+
     /// The pointer shape the application wants over its window now. Polled
     /// after input; the shell only touches the window when it changes.
     fn cursor_shape(&self) -> CursorShape {
@@ -298,15 +257,17 @@ pub trait PixelApp {
         None
     }
 
-    /// Whether the application wants the window closed. Checked after every
-    /// tick, so an application can quit itself.
+    /// Whether the application wants the windows closed. Checked after every
+    /// tick, so an application can quit itself. In a multi-window run one
+    /// vote closes everything; a window that only wants itself gone returns
+    /// [`WindowRequest::Close`] from [`PixelApp::poll_window`] instead.
     fn should_exit(&self) -> bool {
         false
     }
 
     /// The window's system theme is `dark`. Called once at startup (if the
     /// platform reports one) and again on every change, so a screen can
-    /// switch [`crate::palette`]-style light/dark colours without polling.
+    /// switch light/dark colours without polling.
     fn on_theme(&mut self, _dark: bool) {}
 
     /// The application's semantic tree for assistive technology, or `None`
@@ -327,6 +288,33 @@ pub trait PixelApp {
     /// published, such as a click on a button.
     #[cfg(feature = "accessibility")]
     fn on_accessibility_action(&mut self, _request: accesskit::ActionRequest) {}
+}
+
+/// A window an application wants opened or closed. See
+/// [`PixelApp::poll_window`].
+pub enum WindowRequest {
+    /// Open a window with its own application. The new window gets its own
+    /// buffer, presenter and scale; events route to it by its window id.
+    Open {
+        config: WindowConfig,
+        app: Box<dyn PixelApp>,
+    },
+    /// Close the window that asked. Its application gets `on_exit`; when the
+    /// last window closes, the event loop ends.
+    Close,
+}
+
+impl std::fmt::Debug for WindowRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WindowRequest::Open { config, .. } => f
+                .debug_struct("Open")
+                .field("config", config)
+                .field("app", &format_args!(".."))
+                .finish(),
+            WindowRequest::Close => write!(f, "Close"),
+        }
+    }
 }
 
 /// How the window is opened. Sizes are logical pixels.
@@ -371,11 +359,18 @@ impl WindowConfig {
     }
 }
 
-struct Shell<A: PixelApp> {
-    app: A,
+/// One window's worth of everything the loop needs: the application, its
+/// window and presenter once created, its buffer, scale, timers and input
+/// bookkeeping. A single-window run is one slot; [`run_windows`] is N.
+struct Slot {
+    app: Box<dyn PixelApp>,
     config: WindowConfig,
     window: Option<Arc<Window>>,
+    winit_id: Option<WinitWindowId>,
     presenter: Option<Box<dyn Presenter>>,
+    /// A one-shot factory for this slot's presenter, from
+    /// [`run_app_with_presenter`]. Taken when the window is created.
+    presenter_factory: Option<PresenterFactory>,
     buffer: WindowBuffer,
     scale: Scale,
     timer: FrameTimer,
@@ -384,15 +379,11 @@ struct Shell<A: PixelApp> {
     /// First input since the last present. Cleared when that present is timed.
     input_at: Option<Instant>,
     modifiers: Modifiers,
-    /// `None` selects the softbuffer presenter. Taken once in `resumed`.
-    presenter_factory: Option<PresenterFactory>,
     /// When the next unprompted repaint is due, for an app that asked for an
     /// interval. `None` until the first one is scheduled.
     next_tick: Option<Instant>,
     /// The pointer shape last set on the window.
     cursor_shape: CursorShape,
-    #[cfg(feature = "accessibility")]
-    proxy: EventLoopProxy<Host>,
     #[cfg(feature = "accessibility")]
     accessibility: Option<accesskit_winit::Adapter>,
     /// Whether the application has published a tree, so updates are pushed
@@ -401,10 +392,49 @@ struct Shell<A: PixelApp> {
     tree_published: bool,
 }
 
-impl<A: PixelApp> Shell<A> {
+impl Slot {
+    fn new(
+        app: Box<dyn PixelApp>,
+        config: WindowConfig,
+        presenter_factory: Option<PresenterFactory>,
+    ) -> Slot {
+        Slot {
+            app,
+            config,
+            window: None,
+            winit_id: None,
+            presenter: None,
+            presenter_factory,
+            buffer: WindowBuffer::new(1, 1),
+            scale: Scale::ONE,
+            timer: FrameTimer::from_env(),
+            pending_tick: Duration::ZERO,
+            input_at: None,
+            modifiers: Modifiers::default(),
+            next_tick: None,
+            cursor_shape: CursorShape::Default,
+            #[cfg(feature = "accessibility")]
+            accessibility: None,
+            #[cfg(feature = "accessibility")]
+            tree_published: false,
+        }
+    }
+
     fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    fn run_tick(&mut self) {
+        let started = Instant::now();
+        self.app.tick();
+        self.pending_tick = started.elapsed();
+    }
+
+    fn note_input(&mut self) {
+        if self.input_at.is_none() {
+            self.input_at = Some(Instant::now());
         }
     }
 
@@ -449,7 +479,7 @@ impl<A: PixelApp> Shell<A> {
     }
 }
 
-impl<A: PixelApp> Shell<A> {
+impl Slot {
     /// Push the frame just drawn to assistive technology, if any is listening
     /// and the application has a tree to give.
     #[cfg(feature = "accessibility")]
@@ -475,6 +505,131 @@ impl<A: PixelApp> Shell<A> {
 
     #[cfg(not(feature = "accessibility"))]
     fn publish_accessibility(&mut self) {}
+}
+
+struct Shell {
+    slots: Vec<Slot>,
+    /// The presenter factory shared by every window in a multi-window run.
+    /// Taken per window but never consumed, so windows opened later —
+    /// including ones requested at runtime — get the same presenter.
+    shared_presenter: Option<MultiPresenterFactory>,
+    #[cfg(feature = "accessibility")]
+    proxy: EventLoopProxy<Host>,
+}
+
+impl Shell {
+    /// Create the winit window for a slot that has none: the initial slots
+    /// in `resumed`, runtime requests on the next pass, everything again
+    /// after a suspend.
+    fn ensure_window(&mut self, event_loop: &ActiveEventLoop, index: usize) {
+        if self.slots[index].window.is_some() {
+            return;
+        }
+        let slot = &mut self.slots[index];
+        let mut attributes = Window::default_attributes()
+            .with_title(slot.config.title.clone())
+            .with_resizable(slot.config.resizable)
+            .with_inner_size(LogicalSize::new(slot.config.width, slot.config.height));
+        if let (Some(w), Some(h)) = (slot.config.min_width, slot.config.min_height) {
+            attributes = attributes.with_min_inner_size(LogicalSize::new(w, h));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            attributes = attributes
+                .with_titlebar_transparent(slot.config.titlebar_transparent)
+                .with_title_hidden(slot.config.title_hidden)
+                .with_fullsize_content_view(slot.config.fullsize_content_view);
+        }
+        #[cfg(feature = "accessibility")]
+        {
+            // The adapter attaches to the view before it is ever shown, so
+            // the first thing assistive technology sees is a described window.
+            attributes = attributes.with_visible(false);
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .expect("a window should be creatable"),
+        );
+        #[cfg(feature = "accessibility")]
+        {
+            slot.accessibility = Some(accesskit_winit::Adapter::with_event_loop_proxy(
+                event_loop,
+                &window,
+                self.proxy.clone(),
+            ));
+            window.set_visible(true);
+        }
+        apply_ime(&window, slot.app.ime_cursor_area());
+        let presenter: Box<dyn Presenter> = match slot.presenter_factory.take() {
+            Some(factory) => factory(window.clone()).expect("the application's presenter"),
+            None => match &mut self.shared_presenter {
+                Some(factory) => factory(window.clone()).expect("the application's presenter"),
+                None => Box::new(
+                    SoftbufferPresenter::new(window.clone()).expect("a software presenter"),
+                ),
+            },
+        };
+        slot.scale = Scale::new(window.scale_factor());
+        slot.app.on_scale(slot.scale);
+        if let Some(theme) = window.theme() {
+            slot.app.on_theme(theme == WinitTheme::Dark);
+        }
+        slot.winit_id = Some(window.id());
+        slot.window = Some(window);
+        slot.presenter = Some(presenter);
+    }
+}
+
+/// Which slot an event belongs to. A linear scan: a run holds a handful of
+/// windows, and a map would only move the bookkeeping somewhere else.
+fn find_slot(slots: &[Slot], id: WinitWindowId) -> Option<usize> {
+    slots
+        .iter()
+        .position(|slot| slot.winit_id.as_ref() == Some(&id))
+}
+
+/// Queue a freshly requested window. It gets its winit window on the next
+/// pass through the loop, like the initial ones do in `resumed`.
+fn open_slot(slots: &mut Vec<Slot>, config: WindowConfig, app: Box<dyn PixelApp>) {
+    slots.push(Slot::new(app, config, None));
+}
+
+/// Close one window. Its application gets `on_exit`; the loop ends when the
+/// last slot goes, which the caller checks. An unknown index is a no-op.
+fn close_slot(slots: &mut Vec<Slot>, index: usize) {
+    if index < slots.len() {
+        slots[index].app.on_exit();
+        slots.remove(index);
+    }
+}
+
+/// Drain every slot's window requests: opens append, closes remove. Opens
+/// only ever append, so a close's index still points at the window that
+/// asked even when an earlier slot opened new ones first. Returns whether
+/// any slots remain.
+fn drain_requests(slots: &mut Vec<Slot>) -> bool {
+    let mut opens = Vec::new();
+    let mut closes = Vec::new();
+    for (index, slot) in slots.iter_mut().enumerate() {
+        while let Some(request) = slot.app.poll_window() {
+            match request {
+                WindowRequest::Open { config, app } => opens.push((config, app)),
+                WindowRequest::Close => closes.push(index),
+            }
+        }
+    }
+    for (config, app) in opens {
+        open_slot(slots, config, app);
+    }
+    // Highest first so removals never shift a pending index, and deduplicated
+    // so an app that asks twice does not take its neighbour with it.
+    closes.sort_unstable();
+    closes.dedup();
+    for index in closes.into_iter().rev() {
+        close_slot(slots, index);
+    }
+    !slots.is_empty()
 }
 
 /// Translate a winit key into something a counter understands.
@@ -655,7 +810,7 @@ fn translate_ime(ime: &WinitIme) -> ImeEvent {
 /// Apply a pending title request, if any. Split out so the one-shot
 /// convention is testable without a window: with no window yet, the app is
 /// not even asked, so an early title is never lost.
-fn drain_title<A: PixelApp>(app: &mut A, window: Option<&Window>) {
+fn drain_title<A: PixelApp + ?Sized>(app: &mut A, window: Option<&Window>) {
     let Some(window) = window else { return };
     if let Some(title) = app.poll_title() {
         window.set_title(&title);
@@ -663,7 +818,11 @@ fn drain_title<A: PixelApp>(app: &mut A, window: Option<&Window>) {
 }
 
 /// Apply a full-screen request and a pointer-shape change, if any.
-fn drain_window_state<A: PixelApp>(app: &mut A, window: Option<&Window>, shape: &mut CursorShape) {
+fn drain_window_state<A: PixelApp + ?Sized>(
+    app: &mut A,
+    window: Option<&Window>,
+    shape: &mut CursorShape,
+) {
     let Some(window) = window else { return };
     if let Some(full) = app.poll_fullscreen() {
         window.set_fullscreen(full.then_some(winit::window::Fullscreen::Borderless(None)));
@@ -675,7 +834,10 @@ fn drain_window_state<A: PixelApp>(app: &mut A, window: Option<&Window>, shape: 
             CursorShape::Default => winit::window::CursorIcon::Default,
             CursorShape::Text => winit::window::CursorIcon::Text,
             CursorShape::Pointer => winit::window::CursorIcon::Pointer,
-            CursorShape::ResizeHorizontal => winit::window::CursorIcon::ColResize,
+            CursorShape::ResizeHorizontal => winit::window::CursorIcon::EwResize,
+            CursorShape::ResizeVertical => winit::window::CursorIcon::NsResize,
+            CursorShape::ResizeDiagonalTlBr => winit::window::CursorIcon::NwseResize,
+            CursorShape::ResizeDiagonalTrBl => winit::window::CursorIcon::NeswResize,
         });
     }
 }
@@ -692,6 +854,12 @@ pub enum CursorShape {
     Pointer,
     /// A left-right arrow over a draggable vertical edge.
     ResizeHorizontal,
+    /// An up-down arrow over a draggable horizontal edge.
+    ResizeVertical,
+    /// A top-left to bottom-right arrow over a `\` corner handle.
+    ResizeDiagonalTlBr,
+    /// A top-right to bottom-left arrow over a `/` corner handle.
+    ResizeDiagonalTrBl,
 }
 
 /// Whether an interval-driven repaint is due, and when the next one is.
@@ -728,59 +896,11 @@ fn translate_button(button: WinitButton) -> Option<MouseButton> {
     }
 }
 
-impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
+impl ApplicationHandler<Host> for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
+        for index in 0..self.slots.len() {
+            self.ensure_window(event_loop, index);
         }
-        let mut attributes = Window::default_attributes()
-            .with_title(self.config.title.clone())
-            .with_resizable(self.config.resizable)
-            .with_inner_size(LogicalSize::new(self.config.width, self.config.height));
-        if let (Some(w), Some(h)) = (self.config.min_width, self.config.min_height) {
-            attributes = attributes.with_min_inner_size(LogicalSize::new(w, h));
-        }
-        #[cfg(target_os = "macos")]
-        {
-            attributes = attributes
-                .with_titlebar_transparent(self.config.titlebar_transparent)
-                .with_title_hidden(self.config.title_hidden)
-                .with_fullsize_content_view(self.config.fullsize_content_view);
-        }
-        #[cfg(feature = "accessibility")]
-        {
-            // The adapter attaches to the view before it is ever shown, so
-            // the first thing assistive technology sees is a described window.
-            attributes = attributes.with_visible(false);
-        }
-        let window = Arc::new(
-            event_loop
-                .create_window(attributes)
-                .expect("a window should be creatable"),
-        );
-        #[cfg(feature = "accessibility")]
-        {
-            self.accessibility = Some(accesskit_winit::Adapter::with_event_loop_proxy(
-                event_loop,
-                &window,
-                self.proxy.clone(),
-            ));
-            window.set_visible(true);
-        }
-        apply_ime(&window, self.app.ime_cursor_area());
-        let presenter: Box<dyn Presenter> = match self.presenter_factory.take() {
-            Some(factory) => factory(window.clone()).expect("the application's presenter"),
-            None => {
-                Box::new(SoftbufferPresenter::new(window.clone()).expect("a software presenter"))
-            }
-        };
-        self.scale = Scale::new(window.scale_factor());
-        self.app.on_scale(self.scale);
-        if let Some(theme) = window.theme() {
-            self.app.on_theme(theme == WinitTheme::Dark);
-        }
-        self.window = Some(window);
-        self.presenter = Some(presenter);
     }
 
     /// Something arrived on a thread that is not this one.
@@ -792,24 +912,31 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Host) {
         match event {
             Host::Wake => {
-                self.run_tick();
-                self.request_redraw();
+                for slot in &mut self.slots {
+                    slot.run_tick();
+                    slot.request_redraw();
+                }
             }
             #[cfg(feature = "accessibility")]
             Host::Accessibility(event) => {
                 use accesskit_winit::WindowEvent as Access;
+                let Some(index) = find_slot(&self.slots, event.window_id) else {
+                    return;
+                };
                 match event.window_event {
                     Access::InitialTreeRequested => {
-                        if let Some(tree) = self.app.accessibility_tree() {
-                            self.tree_published = true;
-                            if let Some(adapter) = &mut self.accessibility {
+                        let slot = &mut self.slots[index];
+                        if let Some(tree) = slot.app.accessibility_tree() {
+                            slot.tree_published = true;
+                            if let Some(adapter) = &mut slot.accessibility {
                                 adapter.update_if_active(|| tree);
                             }
                         }
                     }
                     Access::ActionRequested(request) => {
-                        self.app.on_accessibility_action(request);
-                        self.request_redraw();
+                        let slot = &mut self.slots[index];
+                        slot.app.on_accessibility_action(request);
+                        slot.request_redraw();
                     }
                     Access::AccessibilityDeactivated => {}
                 }
@@ -818,35 +945,48 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.timer.flush();
+        for slot in &mut self.slots {
+            slot.timer.flush();
+        }
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WinitWindowId,
         event: WindowEvent,
     ) {
+        let Some(index) = find_slot(&self.slots, window_id) else {
+            return;
+        };
         #[cfg(feature = "accessibility")]
-        if let (Some(adapter), Some(window)) = (&mut self.accessibility, &self.window) {
-            adapter.process_event(window, &event);
+        {
+            let slot = &mut self.slots[index];
+            if let (Some(adapter), Some(window)) = (&mut slot.accessibility, &slot.window) {
+                adapter.process_event(window, &event);
+            }
         }
-        match event {
-            WindowEvent::CloseRequested => {
-                self.app.on_exit();
+        if matches!(event, WindowEvent::CloseRequested) {
+            // One window's close box closes that window. The loop ends when
+            // the last one goes, not before.
+            close_slot(&mut self.slots, index);
+            if self.slots.is_empty() {
                 event_loop.exit();
             }
+            return;
+        }
+        let slot = &mut self.slots[index];
+        match event {
+            WindowEvent::CloseRequested => unreachable!("handled above"),
             WindowEvent::Resized(_) => {
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
+                slot.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.scale = Scale::new(scale_factor);
-                self.app.on_scale(self.scale);
+                slot.scale = Scale::new(scale_factor);
+                slot.app.on_scale(slot.scale);
                 // winit follows this with a `Resized` carrying the new
                 // physical size, which triggers the repaint.
-                self.request_redraw();
+                slot.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let physical = physical_label(event.physical_key);
@@ -856,123 +996,142 @@ impl<A: PixelApp> ApplicationHandler<Host> for Shell<A> {
                     &physical,
                     event.state == ElementState::Pressed,
                     event.repeat,
-                    self.modifiers,
+                    slot.modifiers,
                 ) {
                     if decoded.pressed {
-                        self.app.on_key(&decoded.key);
+                        slot.app.on_key(&decoded.key);
                     }
-                    self.app.on_key_event(&decoded);
-                    self.note_input();
-                    self.request_redraw();
+                    slot.app.on_key_event(&decoded);
+                    slot.note_input();
+                    slot.request_redraw();
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                self.modifiers = Modifiers {
+                slot.modifiers = Modifiers {
                     shift: state.shift_key(),
                     control: state.control_key(),
                     alt: state.alt_key(),
                     logo: state.super_key(),
                 };
-                self.app.on_modifiers(self.modifiers);
+                slot.app.on_modifiers(slot.modifiers);
             }
             WindowEvent::ThemeChanged(theme) => {
-                self.app.on_theme(theme == WinitTheme::Dark);
-                self.request_redraw();
+                slot.app.on_theme(theme == WinitTheme::Dark);
+                slot.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.app.on_cursor(position.x as f32, position.y as f32);
+                slot.app.on_cursor(position.x as f32, position.y as f32);
                 // A redraw on every cursor move is what makes hover feedback
                 // work at all under `ControlFlow::Wait`. It costs a full
                 // repaint, which for a screen of panels and text is cheap
                 // enough that measuring it was not worth the complexity of
                 // tracking which region changed.
-                self.request_redraw();
+                slot.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
-                self.app.on_cursor_left();
-                self.request_redraw();
+                slot.app.on_cursor_left();
+                slot.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(button) = translate_button(button) {
-                    self.app.on_mouse(button, state == ElementState::Pressed);
-                    self.request_redraw();
+                    slot.app.on_mouse(button, state == ElementState::Pressed);
+                    slot.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let scrolled = scroll_event(delta, phase);
-                self.app.on_scroll(scrolled.pixel_dx, scrolled.pixel_dy);
-                self.app.on_scroll_event(&scrolled);
-                self.note_input();
-                self.request_redraw();
+                slot.app.on_scroll(scrolled.pixel_dx, scrolled.pixel_dy);
+                slot.app.on_scroll_event(&scrolled);
+                slot.note_input();
+                slot.request_redraw();
             }
             WindowEvent::PinchGesture { delta, phase, .. } => {
-                self.app.on_magnify(gesture_phase(phase), delta);
-                self.note_input();
-                self.request_redraw();
+                slot.app.on_magnify(gesture_phase(phase), delta);
+                slot.note_input();
+                slot.request_redraw();
             }
             WindowEvent::Ime(ime) => {
-                self.app.on_ime(&translate_ime(&ime));
-                self.note_input();
-                self.request_redraw();
+                slot.app.on_ime(&translate_ime(&ime));
+                slot.note_input();
+                slot.request_redraw();
             }
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => slot.redraw(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.run_tick();
-        drain_title(&mut self.app, self.window.as_deref());
-        drain_window_state(
-            &mut self.app,
-            self.window.as_deref(),
-            &mut self.cursor_shape,
-        );
-        if self.app.should_exit() {
-            self.app.on_exit();
+        if !drain_requests(&mut self.slots) {
             event_loop.exit();
             return;
         }
-        match self.app.animation_interval() {
-            Some(interval) if interval.is_zero() => {
-                event_loop.set_control_flow(ControlFlow::Poll);
-                self.request_redraw();
+        for index in 0..self.slots.len() {
+            self.ensure_window(event_loop, index);
+        }
+        for slot in &mut self.slots {
+            slot.run_tick();
+        }
+        for slot in &mut self.slots {
+            drain_title(&mut *slot.app, slot.window.as_deref());
+            drain_window_state(
+                &mut *slot.app,
+                slot.window.as_deref(),
+                &mut slot.cursor_shape,
+            );
+        }
+        if self.slots.iter().any(|slot| slot.app.should_exit()) {
+            for slot in &mut self.slots {
+                slot.app.on_exit();
             }
-            Some(interval) => {
-                let (redraw, deadline) = schedule(Instant::now(), self.next_tick, interval);
-                self.next_tick = Some(deadline);
-                if redraw {
-                    self.request_redraw();
+            event_loop.exit();
+            return;
+        }
+        // One loop, several intervals: polling wins over waiting, and waiting
+        // waits for the earliest deadline. Each slot still schedules through
+        // `schedule`, so the no-spin guarantee holds per window.
+        let now = Instant::now();
+        let mut poll = false;
+        let mut earliest: Option<Instant> = None;
+        for slot in &mut self.slots {
+            match slot.app.animation_interval() {
+                Some(interval) if interval.is_zero() => {
+                    poll = true;
+                    slot.request_redraw();
                 }
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
-            }
-            None => {
-                self.next_tick = None;
-                event_loop.set_control_flow(ControlFlow::Wait);
+                Some(interval) => {
+                    let (redraw, deadline) = schedule(now, slot.next_tick, interval);
+                    slot.next_tick = Some(deadline);
+                    if redraw {
+                        slot.request_redraw();
+                    }
+                    earliest = Some(earliest.map_or(deadline, |best| best.min(deadline)));
+                }
+                None => {
+                    slot.next_tick = None;
+                }
             }
         }
+        event_loop.set_control_flow(if poll {
+            ControlFlow::Poll
+        } else if let Some(deadline) = earliest {
+            ControlFlow::WaitUntil(deadline)
+        } else {
+            ControlFlow::Wait
+        });
     }
 }
 
 pub type PresenterFactory =
     Box<dyn FnOnce(Arc<Window>) -> Result<Box<dyn Presenter>, PresentError>>;
 
-impl<A: PixelApp> Shell<A> {
-    fn run_tick(&mut self) {
-        let started = Instant::now();
-        self.app.tick();
-        self.pending_tick = started.elapsed();
-    }
+/// Builds the presenter for every window in a multi-window run. Unlike
+/// [`PresenterFactory`] it is called once per window rather than once, so
+/// windows opened later — including at runtime — get the same presenter.
+pub type MultiPresenterFactory =
+    Box<dyn Fn(Arc<Window>) -> Result<Box<dyn Presenter>, PresentError>>;
 
-    fn note_input(&mut self) {
-        if self.input_at.is_none() {
-            self.input_at = Some(Instant::now());
-        }
-    }
-}
-
-pub fn run_app<A: PixelApp>(
+pub fn run_app<A: PixelApp + 'static>(
     app: A,
     config: WindowConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -981,37 +1140,57 @@ pub fn run_app<A: PixelApp>(
 
 /// `presenter` replaces the softbuffer default. The closure receives the
 /// window once, when it is created.
-pub fn run_app_with_presenter<A: PixelApp>(
+pub fn run_app_with_presenter<A: PixelApp + 'static>(
     app: A,
     config: WindowConfig,
     presenter: Option<PresenterFactory>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(vec![Slot::new(Box::new(app), config, presenter)], None)
+}
+
+/// Run several windows, each with its own application, sharing one event
+/// loop. Every window behaves like [`run_app`]'s: its own buffer, presenter,
+/// scale and timers, with input routed to it by its window id.
+///
+/// Closing one window's close box closes that window; the loop ends when the
+/// last one goes, or when any application votes [`PixelApp::should_exit`].
+/// An empty list returns `Ok` immediately: there is nothing to show.
+pub fn run_windows(
+    apps: Vec<(WindowConfig, Box<dyn PixelApp>)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_windows_with_presenter(apps, None)
+}
+
+/// [`run_windows`] with a presenter factory shared by every window.
+/// `presenter` replaces the softbuffer default for the initial windows and
+/// for any window an application opens later at runtime.
+pub fn run_windows_with_presenter(
+    apps: Vec<(WindowConfig, Box<dyn PixelApp>)>,
+    presenter: Option<MultiPresenterFactory>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let slots = apps
+        .into_iter()
+        .map(|(config, app)| Slot::new(app, config, None))
+        .collect();
+    run_inner(slots, presenter)
+}
+
+fn run_inner(
+    slots: Vec<Slot>,
+    shared_presenter: Option<MultiPresenterFactory>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<Host>::with_user_event().build()?;
-    let mut app = app;
-    app.attach(Waker {
-        proxy: Some(event_loop.create_proxy()),
-    });
     let mut shell = Shell {
-        app,
-        config,
-        window: None,
-        presenter: None,
-        buffer: WindowBuffer::new(1, 1),
-        scale: Scale::ONE,
-        timer: FrameTimer::from_env(),
-        pending_tick: Duration::ZERO,
-        input_at: None,
-        modifiers: Modifiers::default(),
-        presenter_factory: presenter,
-        next_tick: None,
-        cursor_shape: CursorShape::Default,
+        slots,
+        shared_presenter,
         #[cfg(feature = "accessibility")]
         proxy: event_loop.create_proxy(),
-        #[cfg(feature = "accessibility")]
-        accessibility: None,
-        #[cfg(feature = "accessibility")]
-        tree_published: false,
     };
+    for slot in &mut shell.slots {
+        slot.app.attach(Waker {
+            proxy: Some(event_loop.create_proxy()),
+        });
+    }
     event_loop.run_app(&mut shell)?;
     Ok(())
 }
@@ -1019,6 +1198,9 @@ pub fn run_app_with_presenter<A: PixelApp>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
     use winit::keyboard::SmolStr;
 
     #[test]
@@ -1158,40 +1340,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_plain_click_is_distinguishable_from_a_modified_one() {
-        assert!(Modifiers::default().none());
-        assert!(!Modifiers {
-            shift: true,
-            ..Modifiers::default()
-        }
-        .none());
-        assert!(!Modifiers {
-            logo: true,
-            ..Modifiers::default()
-        }
-        .none());
-    }
-
-    #[test]
-    fn accel_reads_logo_on_macos_and_control_elsewhere() {
-        let ctrl_only = Modifiers {
-            control: true,
-            ..Modifiers::default()
-        };
-        let logo_only = Modifiers {
-            logo: true,
-            ..Modifiers::default()
-        };
-        if cfg!(target_os = "macos") {
-            assert!(logo_only.accel());
-            assert!(!ctrl_only.accel());
-        } else {
-            assert!(ctrl_only.accel());
-            assert!(!logo_only.accel());
-        }
-    }
-
     struct TitleApp {
         polls: usize,
         pending: Option<String>,
@@ -1236,6 +1384,10 @@ mod tests {
         app.on_magnify(GesturePhase::Ended, 0.1);
         assert!(app.ime_cursor_area().is_none());
         assert_eq!(app.poll_title(), None);
+        assert!(
+            app.poll_window().is_none(),
+            "an app that never heard of windows opens none"
+        );
     }
 
     #[test]
@@ -1349,5 +1501,165 @@ mod tests {
             GesturePhase::Cancelled
         );
         assert_eq!(gesture_phase(TouchPhase::Started), GesturePhase::Started);
+    }
+
+    // --- multi-window slots -------------------------------------------------
+
+    struct StubApp {
+        requests: VecDeque<WindowRequest>,
+        exited: Rc<Cell<bool>>,
+    }
+
+    impl PixelApp for StubApp {
+        fn render(&mut self, _buffer: &mut WindowBuffer, _scale: Scale) {}
+
+        fn poll_window(&mut self) -> Option<WindowRequest> {
+            self.requests.pop_front()
+        }
+
+        fn on_exit(&mut self) {
+            self.exited.set(true);
+        }
+    }
+
+    fn stub(requests: Vec<WindowRequest>) -> (Box<dyn PixelApp>, Rc<Cell<bool>>) {
+        let exited = Rc::new(Cell::new(false));
+        let app = StubApp {
+            requests: requests.into(),
+            exited: exited.clone(),
+        };
+        (Box::new(app), exited)
+    }
+
+    fn slot(app: Box<dyn PixelApp>) -> Slot {
+        Slot::new(app, WindowConfig::new("stub", 100.0, 100.0), None)
+    }
+
+    fn open_request(title: &str) -> WindowRequest {
+        let (app, _) = stub(Vec::new());
+        WindowRequest::Open {
+            config: WindowConfig::new(title, 100.0, 100.0),
+            app,
+        }
+    }
+
+    #[test]
+    fn a_runtime_open_appends_a_windowless_slot() {
+        let (app, _) = stub(vec![open_request("second")]);
+        let mut slots = vec![slot(app)];
+
+        assert!(drain_requests(&mut slots), "slots remain");
+        assert_eq!(slots.len(), 2);
+        assert!(
+            slots[1].window.is_none(),
+            "the window is created on the next pass, not in the drain"
+        );
+        assert_eq!(slots[1].config.title, "second");
+    }
+
+    #[test]
+    fn a_window_can_close_itself_and_gets_on_exit() {
+        let (quitter, exited) = stub(vec![WindowRequest::Close]);
+        let (keeper, kept) = stub(Vec::new());
+        let mut slots = vec![slot(quitter), slot(keeper)];
+
+        assert!(drain_requests(&mut slots));
+        assert_eq!(slots.len(), 1);
+        assert!(exited.get(), "the closed app was told");
+        assert!(!kept.get(), "the other one was not");
+    }
+
+    #[test]
+    fn closing_the_last_window_empties_the_run() {
+        let (app, exited) = stub(vec![WindowRequest::Close]);
+        let mut slots = vec![slot(app)];
+
+        assert!(!drain_requests(&mut slots), "nothing remains");
+        assert!(slots.is_empty());
+        assert!(exited.get());
+    }
+
+    #[test]
+    fn a_close_removes_only_the_window_that_asked() {
+        let (first, first_out) = stub(Vec::new());
+        let (middle, middle_out) = stub(vec![WindowRequest::Close]);
+        let (last, last_out) = stub(Vec::new());
+        let mut slots = vec![slot(first), slot(middle), slot(last)];
+
+        drain_requests(&mut slots);
+
+        assert_eq!(slots.len(), 2);
+        assert!(middle_out.get());
+        assert!(!first_out.get() && !last_out.get());
+    }
+
+    #[test]
+    fn opens_do_not_shift_a_close_index() {
+        // Slot 0 opens two windows while slot 1 closes itself. The opens
+        // append at the end, so the close's index still points at slot 1.
+        let (opener, opener_out) = stub(vec![open_request("a"), open_request("b")]);
+        let (closer, closer_out) = stub(vec![WindowRequest::Close]);
+        let mut slots = vec![slot(opener), slot(closer)];
+
+        drain_requests(&mut slots);
+
+        assert_eq!(slots.len(), 3);
+        assert!(closer_out.get());
+        assert!(!opener_out.get(), "the opener was not closed by mistake");
+        assert_eq!(slots[1].config.title, "a");
+        assert_eq!(slots[2].config.title, "b");
+    }
+
+    #[test]
+    fn a_window_can_replace_itself() {
+        // Open and Close in one drain: the new window appears and only the
+        // window that asked goes away.
+        let (app, exited) = stub(vec![open_request("replacement"), WindowRequest::Close]);
+        let mut slots = vec![slot(app)];
+
+        assert!(drain_requests(&mut slots));
+        assert_eq!(slots.len(), 1);
+        assert!(exited.get());
+        assert_eq!(slots[0].config.title, "replacement");
+    }
+
+    #[test]
+    fn a_double_close_takes_only_one_window() {
+        let (app, exited) = stub(vec![WindowRequest::Close, WindowRequest::Close]);
+        let (keeper, kept) = stub(Vec::new());
+        let mut slots = vec![slot(app), slot(keeper)];
+
+        drain_requests(&mut slots);
+
+        assert_eq!(slots.len(), 1, "the neighbour survived");
+        assert!(exited.get());
+        assert!(!kept.get());
+    }
+
+    #[test]
+    fn closing_an_unknown_slot_is_a_no_op() {
+        let (app, exited) = stub(Vec::new());
+        let mut slots = vec![slot(app)];
+
+        close_slot(&mut slots, 5);
+
+        assert_eq!(slots.len(), 1);
+        assert!(!exited.get());
+    }
+
+    #[test]
+    fn a_drain_with_no_requests_changes_nothing() {
+        let (app, _) = stub(Vec::new());
+        let mut slots = vec![slot(app)];
+
+        assert!(drain_requests(&mut slots));
+        assert_eq!(slots.len(), 1);
+    }
+
+    #[test]
+    fn window_requests_describe_themselves() {
+        assert_eq!(format!("{:?}", WindowRequest::Close), "Close");
+        let debug = format!("{:?}", open_request("second"));
+        assert!(debug.contains("second"), "the config shows: {debug}");
     }
 }

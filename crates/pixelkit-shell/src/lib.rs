@@ -1,9 +1,10 @@
-//! pixelkit-shell: a winit + softbuffer host for software-rendered apps.
+//! pixelkit-shell: the pieces a window host and its application share.
 //!
-//! Owns the window, paces redraws, translates input, tracks the scale
-//! factor, and hands finished frames to a [`Presenter`]. Provenance:
-//! `pos-client-ui::shell` (restaurant-pos), with HiDPI and the presenter seam
-//! added; see `ATTRIBUTION.md`.
+//! Per-frame [`Input`], logical-to-physical [`Scale`], the [`Presenter`]
+//! seam that carries a finished buffer to the screen, frame timing and the
+//! clipboard. Window hosting itself — the event loop,
+//! `pixelkit_windowing::PixelApp`, `WindowConfig`, `run_app` — lives in
+//! `pixelkit-windowing`.
 
 pub mod clipboard;
 pub mod frame_log;
@@ -11,16 +12,10 @@ pub mod input;
 pub mod platform;
 pub mod present;
 pub mod scale;
-pub mod shell;
 
 pub use clipboard::Clipboard;
 pub use frame_log::{FrameSnapshot, FrameTimer, PhaseStats};
-pub use input::Input;
+pub use input::{Input, KeyInput, Modifiers, MouseButton};
 pub use platform::{beep, system_accent};
 pub use present::{PresentError, Presenter, PresenterBackend, SoftbufferPresenter};
 pub use scale::Scale;
-pub use shell::{
-    run_app, run_app_with_presenter, CursorShape, GesturePhase, ImeCursorArea, ImeEvent, KeyEvent,
-    KeyInput, Modifiers, MouseButton, PixelApp, PresenterFactory, ScrollEvent, Wake, Waker,
-    WindowConfig,
-};

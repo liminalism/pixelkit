@@ -12,6 +12,7 @@ pixelkit-shell = { workspace = true }
 
 [dev-dependencies]
 pixelkit-text = { workspace = true, features = ["test-fonts"] }
+pixelkit-windowing = { workspace = true }
 
 [features]
 test-fonts = ["pixelkit-text/test-fonts"]

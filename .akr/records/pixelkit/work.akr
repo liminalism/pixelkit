@@ -14,3 +14,20 @@ record pixelkit.work.raster-simd-coverage/1 : work {
         behavior on unsupported targets.
         """
 }
+
+record pixelkit.work.windowing-crate/1 : work {
+    title "Windowing crate: host move, multi-window, panes, in-app windows"
+    state completed
+    intent """
+        Move OS-window hosting out of pixelkit-shell into a new pixelkit-windowing
+        crate, add a multi-OS-window runner, and add in-app draggable panes plus
+        in-app floating windows behind small caller-owned state types, with unit
+        tests for the layout and drag state machines.
+        """
+    note """
+        User decisions (2026-09-29): both OS-level and in-app windows; new crate
+        named pixelkit-windowing. Event vocabulary used by shell's Input collector
+        (KeyInput, Modifiers, MouseButton) stays in pixelkit-shell; host/app
+        protocol types move with the host.
+        """
+}

@@ -11,7 +11,68 @@
 //! it happens to be over. So [`Input::take_click`] takes the click rather than
 //! reading it, and [`Input::end_frame`] clears whatever nothing took.
 
-use crate::shell::{KeyInput, Modifiers, MouseButton};
+/// A key the host recognised, as the application sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyInput {
+    /// A printable character, already normalised — numpad and top-row digits
+    /// arrive identically, because a cashier should not have to care.
+    Character(char),
+    Enter,
+    Escape,
+    Backspace,
+    /// A function key, by number.
+    Function(u8),
+    Left,
+    Right,
+    Up,
+    Down,
+    Tab,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+}
+
+/// Which modifiers were held when an event arrived.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Modifiers {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    /// Cmd on macOS, the Windows/Super key elsewhere. Named `logo` after
+    /// winit's own `super_key()`, since "super" reads as a privilege level
+    /// to most of this codebase's readers.
+    pub logo: bool,
+}
+
+impl Modifiers {
+    /// Nothing held. The common case, and worth naming so a caller reads as
+    /// "a plain click" rather than "no modifiers".
+    pub fn none(self) -> bool {
+        !self.shift && !self.control && !self.alt && !self.logo
+    }
+
+    /// The platform's accelerator modifier for a keyboard shortcut: Cmd on
+    /// macOS, Ctrl everywhere else. A screen wiring up ⌘N/Ctrl+N checks this
+    /// instead of `control` so the shortcut is right on both platforms.
+    pub fn accel(self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.logo
+        } else {
+            self.control
+        }
+    }
+}
+
+/// A mouse button the host reports. Extra buttons on a gaming mouse are
+/// ignored rather than guessed at, for the same reason an unknown key is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Right,
+    Middle,
+}
 
 /// What happened since the last frame.
 #[derive(Debug, Clone, Default)]
@@ -107,6 +168,21 @@ impl Input {
     /// widget that wants to look pressed.
     pub fn pressing(&self, area: pixelkit_raster::Rect) -> bool {
         self.held && self.hovering(area)
+    }
+
+    /// Whether the left button is held down, wherever the cursor is. A drag
+    /// starts on its handle and then leaves it; [`Input::pressing`] goes
+    /// false at the handle's edge, this stays true until the release.
+    pub fn is_held(&self) -> bool {
+        self.held
+    }
+
+    /// Where the unclaimed left press is, if any. Peeking does not consume
+    /// it: a pane divider at a junction, or a title bar under another
+    /// window's content, looks first and only the topmost claimant calls
+    /// [`Input::take_click`].
+    pub fn press_position(&self) -> Option<(i32, i32)> {
+        self.pending_click
     }
 
     /// Claim a click inside `area`, if there is one to claim.
@@ -344,5 +420,69 @@ mod tests {
         let mut input = Input::new();
         input.mouse(MouseButton::Left, true);
         assert!(!input.take_click(Rect::new(0, 0, 1_000, 1_000)));
+    }
+
+    #[test]
+    fn held_outlives_the_handle_a_drag_started_on() {
+        // A divider drag leaves its grab zone on the first pixel of
+        // movement. `pressing` would end it there; `is_held` follows the
+        // button, not the cursor.
+        let mut input = at(10.0, 10.0);
+        input.mouse(MouseButton::Left, true);
+        input.end_frame();
+        input.cursor_moved(400.0, 400.0);
+
+        assert!(input.is_held());
+        assert!(!input.pressing(Rect::new(0, 0, 20, 20)));
+
+        input.mouse(MouseButton::Left, false);
+        assert!(!input.is_held());
+    }
+
+    #[test]
+    fn peeking_at_a_press_leaves_it_claimable() {
+        // Occluded chrome peeks to find the topmost claimant; the claim
+        // itself still goes through `take_click`, exactly once.
+        let mut input = at(10.0, 10.0);
+        input.mouse(MouseButton::Left, true);
+
+        assert_eq!(input.press_position(), Some((10, 10)));
+        assert_eq!(input.press_position(), Some((10, 10)), "peeking is free");
+        assert!(input.take_click(Rect::new(0, 0, 20, 20)));
+        assert_eq!(input.press_position(), None, "claimed means gone");
+    }
+
+    #[test]
+    fn a_plain_click_is_distinguishable_from_a_modified_one() {
+        assert!(Modifiers::default().none());
+        assert!(!Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }
+        .none());
+        assert!(!Modifiers {
+            logo: true,
+            ..Modifiers::default()
+        }
+        .none());
+    }
+
+    #[test]
+    fn accel_reads_logo_on_macos_and_control_elsewhere() {
+        let ctrl_only = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let logo_only = Modifiers {
+            logo: true,
+            ..Modifiers::default()
+        };
+        if cfg!(target_os = "macos") {
+            assert!(logo_only.accel());
+            assert!(!ctrl_only.accel());
+        } else {
+            assert!(ctrl_only.accel());
+            assert!(!logo_only.accel());
+        }
     }
 }

@@ -11,7 +11,8 @@
 - Embedded TrueType `glyf` face parsing, glyph outlines and metrics, character coverage checks, fallback face chains, and text styles with size and tracking.
 - OpenType shaping for supported GSUB and GPOS lookup types, including contextual substitutions, ligatures, kerning, mark-to-base and mark-to-mark attachment. The implementation includes the lookups needed by the bundled Latin and Thai sample fonts.
 - Text measurement, wrapping, truncation, alignment, rasterization, and a bounded string-level cache.
-- A `winit` 0.30 desktop host with `softbuffer` presentation, redraw pacing, HiDPI scale conversion, keyboard and pointer input, scroll and magnify gestures, IME events, clipboard access, and system appearance helpers.
+- A `winit` 0.30 desktop host with single- and multi-window runs, `softbuffer` presentation, redraw pacing, HiDPI scale conversion, keyboard and pointer input, scroll and magnify gestures, IME events, clipboard access, and system appearance helpers.
+- Tiled in-app panes with draggable dividers and floating in-app windows that move, resize, raise, and close.
 - An optional presenter interface for alternate presentation backends, plus opt-in AccessKit accessibility tree and action hooks.
 - Immediate-mode widgets for labels, buttons, tabs, segmented controls, steppers, checkboxes, toggles, radio groups, dropdowns, text fields, tables, scroll lists, tooltips, badges, meters, tracks, pills, panels, and statistics.
 - Focus and keyboard navigation helpers, virtualized tables and lists, and flow-grid layout helpers.
@@ -24,10 +25,11 @@
 |---|---|---|
 | [`pixelkit-raster`](crates/pixelkit-raster) | Pixel buffers, painter, analytic path coverage, bitmap scaling and PNG decode/encode | None |
 | [`pixelkit-text`](crates/pixelkit-text) | TrueType parsing, OpenType shaping, glyph rasterization, wrapping and text cache | `pixelkit-raster` |
-| [`pixelkit-shell`](crates/pixelkit-shell) | Window host, input translation, scale handling and frame presentation | `winit`, `softbuffer`, `pixelkit-raster` |
-| [`pixelkit-ui`](crates/pixelkit-ui) | Immediate-mode widgets and layout utilities | The other three workspace crates |
+| [`pixelkit-shell`](crates/pixelkit-shell) | Per-frame input, scale handling, frame presentation and clipboard | `winit`, `softbuffer`, `pixelkit-raster` |
+| [`pixelkit-ui`](crates/pixelkit-ui) | Immediate-mode widgets and layout utilities | `pixelkit-raster`, `pixelkit-text`, `pixelkit-shell` |
+| [`pixelkit-windowing`](crates/pixelkit-windowing) | OS window hosting, draggable panes and floating windows | `winit`, `softbuffer`, `pixelkit-raster`, `pixelkit-shell` |
 
-The raster, text, and UI crates have no third-party runtime dependencies of their own. The shell uses `winit` and `softbuffer`; its optional `accessibility` feature enables AccessKit support. On macOS, clipboard and platform helpers use safe `objc2` wrappers. Applications provide and embed their own production fonts.
+The raster, text, and UI crates have no third-party runtime dependencies of their own. The shell and windowing crates use `winit` and `softbuffer`; windowing's optional `accessibility` feature enables AccessKit support. On macOS, clipboard and platform helpers use safe `objc2` wrappers. Applications provide and embed their own production fonts.
 
 ## Requirements
 
@@ -52,6 +54,12 @@ cargo run -p pixelkit-ui --example gallery --features test-fonts -- 2
 # Open the interactive widget demo
 cargo run -p pixelkit-ui --example window --features test-fonts
 
+# Draggable panes and floating windows in one window
+cargo run -p pixelkit-windowing --example panes
+
+# Two OS windows sharing one event loop
+cargo run -p pixelkit-windowing --example multi
+
 # Render a glyph sheet and report missing characters
 cargo run -p pixelkit-text --example glyph_sheet --features test-fonts -- [font.ttf ...]
 ```
@@ -68,11 +76,11 @@ The logger periodically reports p50, p95, and maximum timings for the phases it 
 
 ## Application structure
 
-An application implements `pixelkit_shell::PixelApp`. The shell calls its rendering and event hooks, provides a `WindowBuffer`, and presents completed frames. The application can keep its widget state, `Input`, `TextCache`, and `RasterKernel` as ordinary fields. The UI example in [`crates/pixelkit-ui/examples/window.rs`](crates/pixelkit-ui/examples/window.rs) shows this arrangement.
+An application implements `pixelkit_windowing::PixelApp`. The host calls its rendering and event hooks, provides a `WindowBuffer`, and presents completed frames. The application can keep its widget state, `Input`, `TextCache`, and `RasterKernel` as ordinary fields. The UI example in [`crates/pixelkit-ui/examples/window.rs`](crates/pixelkit-ui/examples/window.rs) shows this arrangement.
 
 At a high level, a render pass creates a `Painter` over the supplied buffer and a `Ui` over the painter, text cache, input state, theme, scale, and raster kernel. Draw the desired controls, update application-owned state from their return values, and call `Input::end_frame()` when frame input has been consumed. Coordinates passed to `Ui` are logical pixels and are converted using the supplied `Scale`.
 
-For applications that need a different display path, implement the shell's `Presenter` interface and use `run_app_with_presenter`. The default `run_app` path uses the built-in `SoftbufferPresenter`.
+For applications that need a different display path, implement the shell's `Presenter` interface and use `pixelkit_windowing::run_app_with_presenter` (or `run_windows_with_presenter` for several windows). The default paths use the built-in `SoftbufferPresenter`.
 
 ## Crate notes
 
@@ -90,9 +98,15 @@ The implementation targets the TrueType outlines and OpenType substitutions and 
 
 ### `pixelkit-shell`
 
-`PixelApp` exposes hooks for drawing, ticks, keyboard events, IME input, cursor and mouse events, scrolling, magnification, theme changes, and exit handling. The shell translates platform events into these hooks, tracks physical and logical scale, and presents the software-rendered buffer. `Waker` can request a redraw. Clipboard helpers use the system pasteboard on macOS and an in-memory fallback elsewhere.
+`Input` collects a frame's worth of cursor, button, wheel, and key activity for immediate-mode widgets to claim. `Scale` converts the logical pixels layout is written in to physical pixels. `Presenter` is the seam a finished buffer crosses to reach the screen, with a `softbuffer` implementation built in. `FrameTimer` logs paint-phase timings. Clipboard helpers use the system pasteboard on macOS and an in-memory fallback elsewhere.
 
-Enable `accessibility` on `pixelkit-shell` to publish an application-supplied AccessKit tree and receive accessibility actions. The widgets do not automatically construct a semantic accessibility tree; applications that enable this feature provide that tree through the app hook.
+### `pixelkit-windowing`
+
+`PixelApp` exposes hooks for drawing, ticks, keyboard events, IME input, cursor and mouse events, scrolling, magnification, theme changes, and exit handling. The host translates platform events into these hooks, tracks physical and logical scale, and presents the software-rendered buffer. `Waker` can request a redraw. `run_app` runs one window; `run_windows` runs several, each with its own application, and applications can open or close windows at runtime through `poll_window`.
+
+`Panes` tiles a region with draggable dividers: every interior edge resizes the panes on both sides. `Windows` manages floating windows that move by their title bars, resize by their edges and corners, raise on press, and report close-button presses. Both are caller-owned state updated once a frame before drawing.
+
+Enable `accessibility` on `pixelkit-windowing` to publish an application-supplied AccessKit tree and receive accessibility actions. The widgets do not automatically construct a semantic accessibility tree; applications that enable this feature provide that tree through the app hook.
 
 ### `pixelkit-ui`
 

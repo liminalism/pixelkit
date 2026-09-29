@@ -1111,8 +1111,6 @@ dependencies = [
 name = "pixelkit-shell"
 version = "0.1.0"
 dependencies = [
- "accesskit",
- "accesskit_winit",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "pixelkit-raster",
@@ -1134,6 +1132,21 @@ dependencies = [
  "pixelkit-raster",
  "pixelkit-shell",
  "pixelkit-text",
+ "pixelkit-windowing",
+]
+
+[[package]]
+name = "pixelkit-windowing"
+version = "0.1.0"
+dependencies = [
+ "accesskit",
+ "accesskit_winit",
+ "pixelkit-raster",
+ "pixelkit-shell",
+ "pixelkit-text",
+ "pixelkit-ui",
+ "softbuffer",
+ "winit",
 ]
 
 [[package]]

@@ -24,3 +24,26 @@ record pixelkit.evidence.coverage-simd-tests/1 : evidence {
         116 raster tests passed after the u8x32 merge and the 1024-byte dispatch threshold, including clipped spans and boundary lengths.
         """
 }
+
+record pixelkit.evidence.windowing-live/1 : evidence {
+    title "multi example mapped two titled OS windows; panes example mapped one, survived split/float keys, and exited on q with empty stderr"
+    state verified
+    result pass
+    method observation
+    observed_at git:47807e323751ea9364f560c53bec27c3e2668138
+    summary """
+        multi example mapped two titled OS windows; panes example mapped one, survived split/float keys, and exited on q with empty stderr
+        """
+}
+
+record pixelkit.evidence.windowing-tests/1 : evidence {
+    title "393 passed, 0 failed across all five crates (windowing 66, shell 25, ui 75, raster 116, text 111)"
+    state verified
+    result pass
+    method command
+    observed_at git:47807e323751ea9364f560c53bec27c3e2668138
+    command "cargo test --workspace"
+    summary """
+        393 passed, 0 failed across all five crates (windowing 66, shell 25, ui 75, raster 116, text 111)
+        """
+}
