@@ -22,6 +22,7 @@ pixelkit-ui = { path = "crates/pixelkit-ui" }
 pixelkit-windowing = { path = "crates/pixelkit-windowing" }
 winit = "0.30"
 softbuffer = "0.4"
+zeroize = "1.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

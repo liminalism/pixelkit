@@ -25,6 +25,14 @@ impl Ui<'_> {
     /// toggles it, matching a native checkbox's hit area. Returns whether it
     /// was toggled this frame.
     pub fn checkbox(&mut self, area: Rect, checked: &mut bool, label: &str) -> bool {
+        self.checkbox_focused(area, checked, label, false)
+    }
+
+    /// A checkbox with optional caller-managed focus; a bound Focus takes precedence.
+    pub fn checkbox_focused(&mut self, area: Rect, checked: &mut bool, label: &str, focused: bool) -> bool {
+        let focused = self.control_focus(area, focused);
+        #[cfg(feature = "accessibility")]
+        self.semantic(crate::semantics::Role::CheckBox, label, area, focused, Some(*checked), None);
         let theme = self.theme;
         let hovered = self.input.hovering(area);
         let box_size = self.px(CHECKBOX_SIZE).min(area.h);
@@ -37,13 +45,13 @@ impl Ui<'_> {
         } else {
             theme.panel
         };
-        let edge = if *checked {
+        let edge = if *checked || focused {
             theme.accent
         } else {
             theme.panel_edge
         };
         self.painter
-            .rounded_rect(box_rect, self.px(4), theme.border_width, fill, edge);
+            .rounded_rect(box_rect, self.px(4), if focused { self.px(theme.focus_width) } else { theme.border_width }, fill, edge);
 
         if *checked {
             let b = box_rect;
@@ -81,16 +89,21 @@ impl Ui<'_> {
             self.label(label_area, label, theme.text, Align::Left);
         }
 
-        let clicked = self.input.take_click(area);
+        let clicked = self.input.take_click(area) || (focused && self.input.consume_keys(|keys|
+            keys.iter().any(|key| matches!(key, KeyInput::Enter | KeyInput::Character(' ')))));
         if clicked {
             *checked = !*checked;
         }
         clicked
     }
 
+
     /// A pill-shaped on/off switch with a trailing label. Returns whether it
     /// was toggled this frame.
     pub fn toggle(&mut self, area: Rect, on: &mut bool, label: &str) -> bool {
+        let focused = self.control_focus(area, false);
+        #[cfg(feature = "accessibility")]
+        self.semantic(crate::semantics::Role::Switch, label, area, focused, Some(*on), None);
         let theme = self.theme;
         let hovered = self.input.hovering(area);
         let (logical_w, logical_h) = TOGGLE_SIZE;
@@ -128,8 +141,12 @@ impl Ui<'_> {
             );
             self.label(label_area, label, theme.text, Align::Left);
         }
+        if focused {
+            self.painter.stroke_rect(area, self.px(theme.focus_width), theme.accent);
+        }
 
-        let clicked = self.input.take_click(area);
+        let clicked = self.input.take_click(area) || (focused && self.input.consume_keys(|keys|
+            keys.iter().any(|key| matches!(key, KeyInput::Enter | KeyInput::Character(' ')))));
         if clicked {
             *on = !*on;
         }
@@ -149,6 +166,7 @@ impl Ui<'_> {
         labels: &[&str],
         focused: bool,
     ) -> bool {
+        let focused = self.control_focus(area, focused);
         if labels.is_empty() {
             return false;
         }
@@ -161,6 +179,8 @@ impl Ui<'_> {
         for (index, label) in labels.iter().enumerate() {
             let row = Rect::new(area.x, area.y + row_h * index as i32, area.w, row_h);
             let active = index == *selected;
+            #[cfg(feature = "accessibility")]
+            self.semantic(crate::semantics::Role::RadioButton, label, row, focused && active, Some(active), None);
             let hovered = self.input.hovering(row);
 
             let cx = row.x as f32 + dot_d as f32 / 2.0;
@@ -176,7 +196,7 @@ impl Ui<'_> {
                 cx,
                 cy,
                 outer_r,
-                self.scale.hairline() as f32,
+                if focused && active { self.px(theme.focus_width) as f32 } else { self.scale.hairline() as f32 },
                 ring,
                 255,
             );
@@ -259,6 +279,22 @@ mod tests {
         input
     }
 
+    #[test]
+    fn bound_focus_makes_standard_checkbox_keyboard_operable() {
+        let mut input = Input::new();
+        let mut focus = crate::Focus::new();
+        focus.set(0);
+        input.key(KeyInput::Character(' '));
+        let mut checked = false;
+        let mut buffer = WindowBuffer::new(200, 100);
+        let mut text = TextCache::new(set());
+        let mut kernel = RasterKernel::new();
+        let mut ui = Ui::new(Painter::new(&mut buffer), &mut text, &mut input,
+            Theme::default(), Scale::ONE, &mut kernel).with_focus(&mut focus);
+        let changed = ui.checkbox(Rect::new(0, 0, 120, 24), &mut checked, "Notify me");
+        assert!(changed);
+        assert!(checked);
+    }
     // --- checkbox ---------------------------------------------------------
 
     #[test]

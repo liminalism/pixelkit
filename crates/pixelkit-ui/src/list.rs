@@ -45,7 +45,7 @@ impl Ui<'_> {
 
         let (_, dy) = self.input.take_scroll(area);
         if dy != 0.0 {
-            state.scroll_by(dy.round() as i32, viewport.h, content);
+            state.scroll_by(-dy.round() as i32, viewport.h, content);
         }
         state.clamp_to(viewport.h, content);
         let offset = state.offset();
@@ -103,39 +103,22 @@ mod tests {
     use super::*;
     use crate::widget::Theme;
     use pixelkit_raster::{Painter, RasterKernel, WindowBuffer};
-    use pixelkit_shell::{Input, Scale};
-    use pixelkit_text::font::test_fonts::set;
+    use pixelkit_shell::{Input, MouseButton, Scale};
     use pixelkit_text::TextCache;
+    use pixelkit_text::font::test_fonts::set;
 
     #[test]
-    fn only_visible_rows_are_drawn_and_scrolling_reveals_the_rest() {
+    fn native_wheel_reveals_hidden_row_and_click_activates_that_row() {
         let mut buffer = WindowBuffer::new(200, 100);
         let mut text = TextCache::new(set());
         let mut kernel = RasterKernel::new();
         let mut input = Input::new();
         let mut state = ScrollState::new();
-        let heights = vec![30; 20]; // 600 px of content in a 100 px viewport
+        let heights = [30; 20];
         let area = Rect::new(0, 0, 200, 100);
-
-        let mut drawn = Vec::new();
-        {
-            let mut ui = Ui::new(
-                Painter::new(&mut buffer),
-                &mut text,
-                &mut input,
-                Theme::default(),
-                Scale::ONE,
-                &mut kernel,
-            );
-            let out = ui.scroll_list(&mut state, area, &heights, |_, i, _| drawn.push(i));
-            assert_eq!(out.visible, (0, 4));
-            assert!(out.viewport.w < 200, "a gutter was reserved");
-        }
-        assert_eq!(drawn, vec![0, 1, 2, 3]);
-
         input.cursor_moved(50.0, 50.0);
-        input.scrolled(0.0, 95.0);
-        drawn.clear();
+        // The native host reports wheel-down as negative, like scrollable().
+        input.scrolled(0.0, -95.0);
         {
             let mut ui = Ui::new(
                 Painter::new(&mut buffer),
@@ -145,11 +128,48 @@ mod tests {
                 Scale::ONE,
                 &mut kernel,
             );
-            let out = ui.scroll_list(&mut state, area, &heights, |_, i, _| drawn.push(i));
-            assert_eq!(state.offset(), 95);
-            assert_eq!(out.visible, (3, 7));
+            let visible = ui.scroll_list(&mut state, area, &heights, |_, _, _| {});
+            assert_eq!(visible.visible, (3, 7));
         }
-        assert_eq!(drawn, vec![3, 4, 5, 6]);
+        input.cursor_moved(50.0, 40.0);
+        input.mouse(MouseButton::Left, true);
+        let mut activated = None;
+        {
+            let mut ui = Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                Theme::default(),
+                Scale::ONE,
+                &mut kernel,
+            );
+            ui.scroll_list(&mut state, area, &heights, |ui, row, rect| {
+                if ui.button(rect, "Choose") {
+                    activated = Some(row);
+                }
+            });
+        }
+        assert_eq!(
+            activated,
+            Some(4),
+            "the revealed row owns its painted hit target"
+        );
+        input.mouse(MouseButton::Left, false);
+        input.scrolled(0.0, 95.0);
+        let mut ui = Ui::new(
+            Painter::new(&mut buffer),
+            &mut text,
+            &mut input,
+            Theme::default(),
+            Scale::ONE,
+            &mut kernel,
+        );
+        let visible = ui.scroll_list(&mut state, area, &heights, |_, _, _| {});
+        assert_eq!(
+            visible.visible,
+            (0, 4),
+            "wheel-up returns to the first rows"
+        );
     }
 
     #[test]

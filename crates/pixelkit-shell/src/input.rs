@@ -74,6 +74,35 @@ pub enum MouseButton {
     Middle,
 }
 
+/// A validated native accessibility action for one ordinary text control.
+/// Password controls never accept this plain-text route.
+#[derive(Clone)]
+pub enum AccessibleTextEdit {
+    SetValue(String),
+    SetSelection { anchor: usize, focus: usize },
+}
+
+impl std::fmt::Debug for AccessibleTextEdit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetValue(_) => formatter.write_str("SetValue { contents redacted }"),
+            Self::SetSelection { anchor, focus } => formatter
+                .debug_struct("SetSelection")
+                .field("anchor", anchor)
+                .field("focus", focus)
+                .finish(),
+        }
+    }
+}
+
+impl Drop for AccessibleTextEdit {
+    fn drop(&mut self) {
+        if let Self::SetValue(value) = self {
+            zeroize::Zeroize::zeroize(value);
+        }
+    }
+}
+
 /// What happened since the last frame.
 #[derive(Debug, Clone, Default)]
 pub struct Input {
@@ -90,11 +119,92 @@ pub struct Input {
     /// Keys pressed this frame, in order.
     keys: Vec<KeyInput>,
     modifiers: Modifiers,
+    clipboard: Option<crate::clipboard::ClipboardWorker>,
+    focus_point: Option<(i32, i32)>,
+    composition: String,
+    interaction_epoch: u64,
+    accessible_text_edits: Vec<(pixelkit_raster::Rect, Option<AccessibleTextEdit>)>,
 }
 
 impl Input {
     pub fn new() -> Input {
         Input::default()
+    }
+
+    /// Attach an asynchronous system clipboard owner whose completion callback
+    /// wakes this application's existing event loop.
+    pub fn attach_clipboard(&mut self, clipboard: crate::clipboard::ClipboardWorker) {
+        self.clipboard = Some(clipboard);
+    }
+    pub fn clipboard(&self) -> Option<&crate::clipboard::ClipboardWorker> {
+        self.clipboard.as_ref()
+    }
+    /// Pending asynchronous edits belong to one uninterrupted focus interaction.
+    pub fn interaction_epoch(&self) -> u64 {
+        self.interaction_epoch
+    }
+    fn advance_interaction(&mut self) {
+        self.interaction_epoch = self
+            .interaction_epoch
+            .checked_add(1)
+            .expect("input epoch exhausted");
+        zeroize::Zeroize::zeroize(&mut self.composition);
+    }
+    fn invalidate_interaction(&mut self) {
+        self.advance_interaction();
+        self.clear_accessible_text_edit();
+    }
+    /// Window focus was lost. Do not clear a field's text or its logical focus.
+    pub fn blur(&mut self) {
+        self.invalidate_interaction();
+        self.end_frame();
+        self.held = false;
+        self.modifiers = Modifiers::default();
+    }
+    pub fn focus_at(&mut self, x: i32, y: i32) {
+        self.invalidate_interaction();
+        self.focus_point = Some((x, y));
+    }
+    pub fn focus_requested(&self, area: pixelkit_raster::Rect) -> bool {
+        self.focus_point.is_some_and(|(x, y)| area.contains(x, y))
+    }
+    pub fn set_composition(&mut self, text: &str) {
+        if self.composition != text {
+            self.invalidate_interaction();
+            self.composition.push_str(text);
+        }
+    }
+    pub fn composition(&self) -> &str {
+        &self.composition
+    }
+
+    /// Queue a live ordinary control's edit before drawing. Actions retain their
+    /// order within a frame; a later selection must not replace an earlier value.
+    /// Identity/layout changes must call `clear_accessible_text_edit`.
+    pub fn set_accessible_text_edit(
+        &mut self,
+        area: pixelkit_raster::Rect,
+        edit: AccessibleTextEdit,
+    ) {
+        self.advance_interaction();
+        self.focus_point = Some((area.x + area.w / 2, area.y + area.h / 2));
+        self.accessible_text_edits.push((area, Some(edit)));
+    }
+
+    /// Consume one matching edit, without moving other controls' queued payloads.
+    pub fn take_accessible_text_edit(
+        &mut self,
+        area: pixelkit_raster::Rect,
+    ) -> Option<AccessibleTextEdit> {
+        self.accessible_text_edits
+            .iter_mut()
+            .find(|(target, edit)| *target == area && edit.is_some())
+            .and_then(|(_, edit)| edit.take())
+    }
+
+    /// Retire actions before replacing a surface/control identity or its layout.
+    pub fn clear_accessible_text_edit(&mut self) {
+        self.accessible_text_edits.clear();
     }
 
     // --- what the shell calls -------------------------------------------
@@ -114,6 +224,7 @@ impl Input {
     pub fn mouse(&mut self, button: MouseButton, pressed: bool) {
         match (button, pressed) {
             (MouseButton::Left, true) => {
+                self.invalidate_interaction();
                 self.held = true;
                 self.pending_click = self.cursor;
             }
@@ -129,6 +240,7 @@ impl Input {
     }
 
     pub fn key(&mut self, key: KeyInput) {
+        self.invalidate_interaction();
         self.keys.push(key);
     }
 
@@ -145,8 +257,10 @@ impl Input {
     pub fn end_frame(&mut self) {
         self.pending_click = None;
         self.pending_context = None;
+        self.focus_point = None;
         self.scroll = (0.0, 0.0);
         self.keys.clear();
+        self.clear_accessible_text_edit();
     }
 
     // --- what widgets ask -----------------------------------------------
@@ -244,10 +358,47 @@ impl Input {
     }
 }
 
+impl Drop for Input {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.composition);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pixelkit_raster::Rect;
+    #[test]
+    fn queued_typing_or_ime_edit_retires_paste_before_the_next_frame() {
+        let mut input = Input::new();
+        let submitted = input.interaction_epoch();
+        input.key(KeyInput::Character('文'));
+        assert_ne!(input.interaction_epoch(), submitted);
+        let typed = input.interaction_epoch();
+        input.set_composition("ไทย");
+        assert_ne!(input.interaction_epoch(), typed);
+        assert_eq!(input.composition(), "ไทย");
+    }
+    #[test]
+    fn blur_retires_an_async_edit_even_if_focus_returns_before_a_frame() {
+        let mut input = Input::new();
+        input.set_composition("รหัส😀");
+        input.modifiers_changed(Modifiers {
+            control: true,
+            ..Modifiers::default()
+        });
+        input.key(KeyInput::Character('v'));
+        let submitted = input.interaction_epoch();
+        input.blur();
+        assert_ne!(input.interaction_epoch(), submitted);
+        assert!(input.composition().is_empty());
+        assert!(input.keys().is_empty());
+        assert_eq!(input.modifiers(), Modifiers::default());
+        let blurred = input.interaction_epoch();
+        input.focus_at(10, 20);
+        assert_ne!(input.interaction_epoch(), blurred);
+        assert_ne!(input.interaction_epoch(), submitted);
+    }
 
     fn at(x: f32, y: f32) -> Input {
         let mut input = Input::new();
@@ -455,16 +606,20 @@ mod tests {
     #[test]
     fn a_plain_click_is_distinguishable_from_a_modified_one() {
         assert!(Modifiers::default().none());
-        assert!(!Modifiers {
-            shift: true,
-            ..Modifiers::default()
-        }
-        .none());
-        assert!(!Modifiers {
-            logo: true,
-            ..Modifiers::default()
-        }
-        .none());
+        assert!(
+            !Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            }
+            .none()
+        );
+        assert!(
+            !Modifiers {
+                logo: true,
+                ..Modifiers::default()
+            }
+            .none()
+        );
     }
 
     #[test]

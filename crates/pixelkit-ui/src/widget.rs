@@ -35,6 +35,7 @@ use std::borrow::Cow;
 use pixelkit_raster::{Painter, RasterKernel, Rect};
 use pixelkit_shell::{Input, KeyInput, Scale};
 use pixelkit_text::{Align, FaceId, TextCache, TextStyle};
+use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
 /// Colours and sizes, in one place so a screen does not invent its own.
 #[derive(Debug, Clone, Copy)]
@@ -58,12 +59,16 @@ pub struct Theme {
     pub selection: u32,
     pub row_height: i32,
     /// Body text.
+    /// Logical em size on construction; `Ui::new` converts its theme copy to device pixels.
     pub body: TextStyle,
+    /// Logical em size on construction; `Ui::new` converts its theme copy to device pixels.
     /// Headings.
     pub heading: TextStyle,
     pub padding: i32,
     pub corner_radius: i32,
     pub border_width: i32,
+    /// Logical thickness of keyboard/assistive focus outlines.
+    pub focus_width: i32,
 }
 
 impl Default for Theme {
@@ -91,6 +96,7 @@ impl Default for Theme {
             padding: 10,
             corner_radius: 7,
             border_width: 1,
+            focus_width: 1,
         }
     }
 }
@@ -100,11 +106,15 @@ pub struct Ui<'a> {
     pub painter: Painter<'a>,
     pub text: &'a mut TextCache,
     pub input: &'a mut Input,
+    /// Effective theme: font styles are device pixels; dimensional tokens remain logical.
     pub theme: Theme,
     /// Logical→physical; widgets that take logical sizes go through it.
     pub scale: Scale,
     /// Scratch for anti-aliased shapes.
     pub kernel: &'a mut RasterKernel,
+    focus: Option<&'a mut crate::Focus>,
+    #[cfg(feature = "accessibility")]
+    pub(crate) semantics: Option<&'a mut crate::semantics::Semantics>,
 }
 
 impl<'a> Ui<'a> {
@@ -112,10 +122,12 @@ impl<'a> Ui<'a> {
         painter: Painter<'a>,
         text: &'a mut TextCache,
         input: &'a mut Input,
-        theme: Theme,
+        mut theme: Theme,
         scale: Scale,
         kernel: &'a mut RasterKernel,
     ) -> Ui<'a> {
+        theme.body.size *= scale.0;
+        theme.heading.size *= scale.0;
         Ui {
             painter,
             text,
@@ -123,9 +135,62 @@ impl<'a> Ui<'a> {
             theme,
             scale,
             kernel,
+            focus: None,
+            #[cfg(feature = "accessibility")]
+            semantics: None,
         }
     }
 
+    /// Convert a custom logical text style once before measuring or drawing.
+    /// `Ui::theme` font styles are already physical and must not pass through this.
+    pub fn text_style(&self, mut logical: TextStyle) -> TextStyle {
+        logical.size *= self.scale.0;
+        logical
+    }
+
+    /// Opt into standard-control Tab traversal. Reset Focus when the page/row identity changes.
+    pub fn with_focus(mut self, focus: &'a mut crate::Focus) -> Self {
+        focus.handle_tab(self.input.keys(), self.input.modifiers());
+        self.focus = Some(focus);
+        self
+    }
+
+    /// Register a custom-painted actionable control in the existing frame focus order.
+    pub fn control_focus(&mut self, area: Rect, explicit: bool) -> bool {
+        match &mut self.focus {
+            Some(focus) => focus.register_at(self.input, area),
+            None => explicit,
+        }
+    }
+
+    #[cfg(feature = "accessibility")]
+    pub fn with_semantics(mut self, semantics: &'a mut crate::semantics::Semantics) -> Self {
+        self.semantics = Some(semantics);
+        self
+    }
+    /// Only the modal overlay, not the painted background, remains actionable.
+    #[cfg(feature = "accessibility")]
+    pub fn modal_semantics(&mut self) {
+        if let Some(semantics) = &mut self.semantics {
+            semantics.clear_controls();
+        }
+    }
+
+    /// Describe a custom-painted control using the same current-frame action adapter.
+    #[cfg(feature = "accessibility")]
+    pub fn semantic(
+        &mut self,
+        role: crate::semantics::Role,
+        label: &str,
+        area: Rect,
+        focused: bool,
+        checked: Option<bool>,
+        value: Option<&str>,
+    ) {
+        if let Some(semantics) = &mut self.semantics {
+            semantics.add(role, label, area, focused, checked, value);
+        }
+    }
     /// Logical pixels to physical, through the frame's scale.
     #[inline]
     pub fn px(&self, logical: i32) -> i32 {
@@ -155,7 +220,7 @@ impl<'a> Ui<'a> {
         self.label_styled(area, value, style, colour, align);
     }
 
-    /// One line of text in an explicit style, vertically centred in `area`.
+    /// One line of text in an explicit device-pixel style, vertically centred in `area`.
     pub fn label_styled(
         &mut self,
         area: Rect,
@@ -182,6 +247,21 @@ impl<'a> Ui<'a> {
 
     /// A clickable button. Returns whether it was pressed this frame.
     pub fn button(&mut self, area: Rect, label: &str) -> bool {
+        let focused = self.control_focus(area, false);
+        self.button_focused(area, label, focused)
+    }
+
+    /// A button with caller-managed keyboard focus.
+    pub fn button_focused(&mut self, area: Rect, label: &str, focused: bool) -> bool {
+        #[cfg(feature = "accessibility")]
+        self.semantic(
+            crate::semantics::Role::Button,
+            label,
+            area,
+            focused,
+            None,
+            None,
+        );
         let pressed = self.input.pressing(area);
         let hovered = self.input.hovering(area);
         let fill = if pressed {
@@ -194,12 +274,25 @@ impl<'a> Ui<'a> {
         self.painter.rounded_rect(
             area,
             self.theme.corner_radius,
-            self.theme.border_width,
+            if focused {
+                self.px(self.theme.focus_width)
+            } else {
+                self.theme.border_width
+            },
             fill,
-            self.theme.panel_edge,
+            if focused {
+                self.theme.accent
+            } else {
+                self.theme.panel_edge
+            },
         );
         self.label(area, label, self.theme.text, Align::Centre);
         self.input.take_click(area)
+            || (focused
+                && self.input.consume_keys(|keys| {
+                    keys.iter()
+                        .any(|key| matches!(key, KeyInput::Enter | KeyInput::Character(' ')))
+                }))
     }
 
     /// A row of tabs. Returns true if the selection changed.
@@ -976,25 +1069,84 @@ mod tests {
 
 /// An editable line of text, and where the caret sits in it.
 ///
-/// The caret is a **byte offset**, and it is never allowed to land inside a
-/// cluster. Thai stacks marks on their base — ก้ is two characters and one
-/// letter — so a caret between them is a position no reader recognises, and
-/// backspacing from it removes a tone mark and silently changes the word
-/// rather than deleting anything the typist can see.
-///
-/// This is the same rule [`crate::text::TextCache::truncate`] follows for
-/// cutting, applied to moving and deleting, and it is checked the same way:
-/// exhaustively, at every position in a string full of awkward stacks.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The caret is a **byte offset** on a Unicode extended-grapheme boundary.
+/// Movement, selection, deletion and masking share UAX #29 segmentation,
+/// including combining marks, emoji modifiers/ZWJ sequences and flag pairs.
+/// The stored UTF-8 is never normalized.
+#[derive(Default)]
 pub struct TextFieldState {
     text: String,
+    sensitive: bool,
     caret: usize,
     /// The other end of a selection, when one exists: the range is
     /// `anchor..caret`, normalised. `None` is the overwhelmingly common
     /// case — every caret move and every edit clears it — so unselected
     /// fields behave exactly as before.
     selection_anchor: Option<usize>,
+    clipboard_edit: Option<Box<ClipboardEdit>>,
+    clipboard_error: Option<String>,
+    caret_area: Option<Rect>,
+    masked_display: String,
+    mask_dirty: bool,
 }
+
+#[derive(Debug)]
+struct ClipboardEdit {
+    task: pixelkit_shell::clipboard::ClipboardTask,
+    text: String,
+    sensitive: bool,
+    caret: usize,
+    selection: Option<usize>,
+    paste: bool,
+    cut: bool,
+    interaction_epoch: u64,
+}
+
+impl Drop for ClipboardEdit {
+    fn drop(&mut self) {
+        if self.sensitive {
+            zeroize::Zeroize::zeroize(&mut self.text);
+        }
+    }
+}
+
+impl std::fmt::Debug for TextFieldState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TextFieldState")
+            .field(
+                "text",
+                &if self.sensitive {
+                    "<redacted>"
+                } else {
+                    self.text.as_str()
+                },
+            )
+            .field("caret", &self.caret)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for TextFieldState {
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            caret: self.caret,
+            sensitive: self.sensitive,
+            selection_anchor: self.selection_anchor,
+            mask_dirty: true,
+            ..Self::default()
+        }
+    }
+}
+impl PartialEq for TextFieldState {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.caret == other.caret
+            && self.selection_anchor == other.selection_anchor
+    }
+}
+impl Eq for TextFieldState {}
 
 impl TextFieldState {
     pub fn new() -> TextFieldState {
@@ -1007,6 +1159,8 @@ impl TextFieldState {
             caret: text.len(),
             text,
             selection_anchor: None,
+            mask_dirty: true,
+            ..Self::default()
         }
     }
 
@@ -1018,32 +1172,265 @@ impl TextFieldState {
         self.caret
     }
 
+    /// Physical caret rectangle from the last focused render, for the host's
+    /// IME candidate placement. Layout is converted to physical pixels once.
+    pub fn caret_area(&self) -> Option<Rect> {
+        self.caret_area
+    }
+
+    pub fn apply_with_modifiers(
+        &mut self,
+        keys: &[KeyInput],
+        modifiers: pixelkit_shell::Modifiers,
+    ) -> bool {
+        let mut changed = false;
+        for key in keys {
+            if modifiers.shift
+                && matches!(
+                    key,
+                    KeyInput::Left | KeyInput::Right | KeyInput::Home | KeyInput::End
+                )
+            {
+                let anchor = self.selection_anchor.unwrap_or(self.caret);
+                self.apply(std::slice::from_ref(key));
+                self.selection_anchor = Some(anchor);
+            } else {
+                changed |= self.apply(std::slice::from_ref(key));
+            }
+        }
+        changed
+    }
+
+    /// Last clipboard failure; contains no field contents. Surfaces may show
+    /// this inline instead of claiming a copy or paste succeeded.
+    pub fn clipboard_error(&self) -> Option<&str> {
+        self.clipboard_error.as_deref()
+    }
+
+    fn clipboard_keys(
+        &mut self,
+        keys: &[KeyInput],
+        modifiers: pixelkit_shell::Modifiers,
+        masked: bool,
+        worker: Option<&pixelkit_shell::clipboard::ClipboardWorker>,
+        interaction_epoch: u64,
+    ) -> bool {
+        let mut changed = false;
+        for key in keys {
+            if (modifiers.control || modifiers.logo) && !modifiers.alt {
+                let KeyInput::Character(character) = key else {
+                    continue;
+                };
+                let character = character.to_ascii_lowercase();
+                if character == 'a' {
+                    self.clipboard_edit = None;
+                    self.select_all();
+                } else if matches!(character, 'c' | 'x' | 'v') {
+                    if masked && character != 'v' {
+                        continue;
+                    }
+                    self.clipboard_edit = None;
+                    let operation = match worker {
+                        Some(worker) if character == 'v' => worker.paste(),
+                        Some(worker) => {
+                            let Some(text) = self.selected_text() else {
+                                continue;
+                            };
+                            worker.copy(text.to_owned())
+                        }
+                        None => Err(pixelkit_shell::clipboard::ClipboardError(
+                            "system clipboard not attached".into(),
+                        )),
+                    };
+                    match operation {
+                        Ok(task) => {
+                            self.clipboard_error = None;
+                            self.clipboard_edit = Some(Box::new(ClipboardEdit {
+                                task,
+                                text: self.text.clone(),
+                                caret: self.caret,
+                                sensitive: self.sensitive,
+                                interaction_epoch,
+                                selection: self.selection_anchor,
+                                paste: character == 'v',
+                                cut: character == 'x',
+                            }));
+                        }
+                        Err(error) => self.clipboard_error = Some(error.to_string()),
+                    }
+                }
+                // Ctrl shortcuts must never insert their letters into a field.
+            } else {
+                self.clipboard_edit = None;
+                changed |= self.apply_with_modifiers(std::slice::from_ref(key), modifiers);
+            }
+        }
+        changed
+    }
+
+    fn finish_clipboard(&mut self, focused: bool, interaction_epoch: u64) -> bool {
+        if !focused
+            || self
+                .clipboard_edit
+                .as_ref()
+                .is_some_and(|edit| edit.interaction_epoch != interaction_epoch)
+        {
+            self.clipboard_edit = None;
+            return false;
+        }
+        let Some(result) = self
+            .clipboard_edit
+            .as_ref()
+            .and_then(|edit| edit.task.try_result())
+        else {
+            return false;
+        };
+        let edit = self
+            .clipboard_edit
+            .take()
+            .expect("completed clipboard edit");
+        match result {
+            Err(error) => {
+                self.clipboard_error = Some(error.to_string());
+                false
+            }
+            Ok(text)
+                if edit.text == self.text
+                    && edit.caret == self.caret
+                    && edit.selection == self.selection_anchor =>
+            {
+                if edit.paste {
+                    if let Some(mut text) = text {
+                        self.insert_str(&text);
+                        if self.sensitive {
+                            zeroize::Zeroize::zeroize(&mut text);
+                        }
+                        return true;
+                    }
+                } else if edit.cut {
+                    return self.delete_selection();
+                }
+                false
+            }
+            Ok(mut text) => {
+                if self.sensitive {
+                    if let Some(text) = &mut text {
+                        zeroize::Zeroize::zeroize(text);
+                    }
+                }
+                false
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
     pub fn clear(&mut self) {
+        if self.sensitive {
+            zeroize::Zeroize::zeroize(&mut self.text);
+        }
+        self.clipboard_edit = None;
         self.text.clear();
+        self.masked_display.clear();
+        self.mask_dirty = false;
         self.caret = 0;
         self.selection_anchor = None;
     }
 
+    /// Clear owned sensitive buffers, including a pending clipboard edit snapshot.
+    /// Marks this field sensitive for Debug/replacement. Its owner must call this on
+    /// sensitive page leave/drop; this is not an OS credential or clipboard policy.
+    pub fn clear_sensitive(&mut self) {
+        self.sensitive = true;
+        zeroize::Zeroize::zeroize(&mut self.text);
+        self.masked_display.clear();
+        self.mask_dirty = false;
+        if let Some(edit) = &mut self.clipboard_edit {
+            zeroize::Zeroize::zeroize(&mut edit.text);
+        }
+        self.clipboard_edit = None;
+        self.caret = 0;
+        self.selection_anchor = None;
+        self.caret_area = None;
+    }
+
+    /// Move the field value without cloning; cancel and clear any edit snapshot.
+    pub fn take_text(&mut self) -> String {
+        if let Some(edit) = &mut self.clipboard_edit {
+            zeroize::Zeroize::zeroize(&mut edit.text);
+        }
+        self.clipboard_edit = None;
+        self.caret = 0;
+        self.selection_anchor = None;
+        self.caret_area = None;
+        self.masked_display.clear();
+        self.mask_dirty = false;
+        std::mem::take(&mut self.text)
+    }
+
     pub fn set_text(&mut self, text: impl Into<String>) {
+        if self.sensitive {
+            self.clear_sensitive();
+        }
+        self.clipboard_edit = None;
         self.text = text.into();
+        self.mask_dirty = true;
         self.caret = self.text.len();
         self.selection_anchor = None;
+    }
+
+    fn apply_accessible_edit(
+        &mut self,
+        mut edit: pixelkit_shell::input::AccessibleTextEdit,
+    ) -> bool {
+        match &mut edit {
+            pixelkit_shell::input::AccessibleTextEdit::SetValue(value) => {
+                let changed = self.text != *value;
+                self.set_text(std::mem::take(value));
+                changed
+            }
+            pixelkit_shell::input::AccessibleTextEdit::SetSelection { anchor, focus } => {
+                self.clipboard_edit = None;
+                self.selection_anchor = Some(self.snap_grapheme_boundary(*anchor));
+                self.caret = self.snap_grapheme_boundary(*focus);
+                false
+            }
+        }
+    }
+
+    fn snap_grapheme_boundary(&self, at: usize) -> usize {
+        let mut at = at.min(self.text.len());
+        while !self.text.is_char_boundary(at) {
+            at -= 1;
+        }
+        let mut cursor = GraphemeCursor::new(at, self.text.len(), true);
+        if cursor
+            .is_boundary(&self.text, 0)
+            .expect("complete field text")
+        {
+            at
+        } else {
+            cursor
+                .prev_boundary(&self.text, 0)
+                .expect("complete field text")
+                .unwrap_or(0)
+        }
     }
 
     /// Select everything, for copy-out or type-over. The caret moves to the
     /// end, matching a native field; [`TextFieldState::clear_selection`]
     /// drops it again.
     pub fn select_all(&mut self) {
+        self.clipboard_edit = None;
         self.selection_anchor = Some(0);
         self.caret = self.text.len();
     }
 
     /// Drop the selection, keeping caret and text.
     pub fn clear_selection(&mut self) {
+        self.clipboard_edit = None;
         self.selection_anchor = None;
     }
 
@@ -1074,10 +1461,11 @@ impl TextFieldState {
             .map(|(start, end)| &self.text[start..end])
     }
 
-    /// Remove the selected text, leaving the caret at its start. Returns
+    /// Remove the selected text, keeping the caret on the resulting cluster boundary. Returns
     /// whether text was removed. Always drops the selection, even an empty
     /// one, so every edit below can call it unconditionally.
     pub fn delete_selection(&mut self) -> bool {
+        self.clipboard_edit = None;
         let Some(anchor) = self.selection_anchor.take() else {
             return false;
         };
@@ -1091,40 +1479,39 @@ impl TextFieldState {
             return false;
         }
         self.text.replace_range(start..end, "");
+        self.mask_dirty = true;
+        self.caret = self.caret_after_edit(self.caret);
         true
     }
 
-    /// The start of the cluster containing `at`: back off any combining marks.
-    fn cluster_start(&self, mut at: usize) -> usize {
-        at = at.min(self.text.len());
-        while at > 0
-            && self.text[at..]
-                .chars()
-                .next()
-                .is_some_and(pixelkit_text::font::is_thai_combining)
-        {
-            at -= self.text[..at]
-                .chars()
-                .next_back()
-                .map(char::len_utf8)
-                .unwrap_or(1);
-        }
-        at
+    fn previous_cluster(&self, at: usize) -> usize {
+        GraphemeCursor::new(at, self.text.len(), true)
+            .prev_boundary(&self.text, 0)
+            .expect("complete field text")
+            .unwrap_or(0)
     }
 
-    /// The end of the cluster starting at `at`: one base plus its marks.
-    fn cluster_end(&self, at: usize) -> usize {
-        let mut end = match self.text[at..].chars().next() {
-            Some(character) => at + character.len_utf8(),
-            None => return at,
-        };
-        while let Some(next) = self.text[end..].chars().next() {
-            if !pixelkit_text::font::is_thai_combining(next) {
-                break;
-            }
-            end += next.len_utf8();
+    fn next_cluster(&self, at: usize) -> usize {
+        GraphemeCursor::new(at, self.text.len(), true)
+            .next_boundary(&self.text, 0)
+            .expect("complete field text")
+            .unwrap_or(self.text.len())
+    }
+
+    /// Editing can join neighboring clusters; keep the caret after the whole result.
+    fn caret_after_edit(&self, at: usize) -> usize {
+        let mut cursor = GraphemeCursor::new(at, self.text.len(), true);
+        if cursor
+            .is_boundary(&self.text, 0)
+            .expect("complete field text")
+        {
+            at
+        } else {
+            cursor
+                .next_boundary(&self.text, 0)
+                .expect("complete field text")
+                .unwrap_or(self.text.len())
         }
-        end
     }
 
     pub fn move_left(&mut self) {
@@ -1132,13 +1519,7 @@ impl TextFieldState {
         if self.caret == 0 {
             return;
         }
-        let previous = self.caret
-            - self.text[..self.caret]
-                .chars()
-                .next_back()
-                .map(char::len_utf8)
-                .unwrap_or(1);
-        self.caret = self.cluster_start(previous);
+        self.caret = self.previous_cluster(self.caret);
     }
 
     pub fn move_right(&mut self) {
@@ -1146,7 +1527,7 @@ impl TextFieldState {
         if self.caret >= self.text.len() {
             return;
         }
-        self.caret = self.cluster_end(self.caret);
+        self.caret = self.next_cluster(self.caret);
     }
 
     pub fn home(&mut self) {
@@ -1160,18 +1541,20 @@ impl TextFieldState {
     }
 
     pub fn insert(&mut self, character: char) {
-        self.delete_selection();
-        self.text.insert(self.caret, character);
-        self.caret += character.len_utf8();
+        let mut encoded = [0; 4];
+        self.insert_str(character.encode_utf8(&mut encoded));
     }
 
     /// Insert a whole string — what an IME `Commit` delivers — replacing any
     /// selection first, exactly as single-character [`TextFieldState::insert`]
     /// does. The caret lands after the inserted text.
     pub fn insert_str(&mut self, text: &str) {
-        self.delete_selection();
-        self.text.insert_str(self.caret, text);
-        self.caret += text.len();
+        self.clipboard_edit = None;
+        let (start, end) = self.selection_range().unwrap_or((self.caret, self.caret));
+        self.selection_anchor = None;
+        self.text.replace_range(start..end, text);
+        self.mask_dirty = true;
+        self.caret = self.caret_after_edit(start + text.len());
     }
 
     /// Delete backwards — the selection if there is one, otherwise the
@@ -1183,15 +1566,10 @@ impl TextFieldState {
         if self.caret == 0 {
             return;
         }
-        let previous = self.caret
-            - self.text[..self.caret]
-                .chars()
-                .next_back()
-                .map(char::len_utf8)
-                .unwrap_or(1);
-        let start = self.cluster_start(previous);
+        let start = self.previous_cluster(self.caret);
         self.text.replace_range(start..self.caret, "");
-        self.caret = start;
+        self.mask_dirty = true;
+        self.caret = self.caret_after_edit(start);
     }
 
     /// Delete forwards — the selection if there is one, otherwise a
@@ -1203,8 +1581,20 @@ impl TextFieldState {
         if self.caret >= self.text.len() {
             return;
         }
-        let end = self.cluster_end(self.caret);
+        let end = self.next_cluster(self.caret);
         self.text.replace_range(self.caret..end, "");
+        self.mask_dirty = true;
+        self.caret = self.caret_after_edit(self.caret);
+    }
+
+    fn refresh_mask(&mut self) {
+        if !self.mask_dirty {
+            return;
+        }
+        self.masked_display.clear();
+        self.masked_display
+            .extend(std::iter::repeat_n(MASK_GLYPH, cluster_count(&self.text)));
+        self.mask_dirty = false;
     }
 
     /// Apply a frame's keys. Returns whether the text changed.
@@ -1238,20 +1628,11 @@ impl TextFieldState {
 /// The glyph a masked field shows in place of one grapheme cluster. ASCII, so
 /// it renders in any embedded face without a fallback lookup — the one place
 /// a password field cannot afford to show a `.notdef` box instead of a dot.
-const MASK_GLYPH: &str = "*";
+const MASK_GLYPH: char = '*';
 
-/// How many Thai grapheme clusters (or plain characters, outside Thai) make
-/// up `text` — the unit [`mask`] shows one glyph per, so a stacked cluster
-/// like ก็ hides as one dot rather than two.
+/// Count the same extended graphemes used by movement and deletion.
 fn cluster_count(text: &str) -> usize {
-    text.chars()
-        .filter(|&character| !pixelkit_text::font::is_thai_combining(character))
-        .count()
-}
-
-/// `text`, replaced one [`MASK_GLYPH`] per grapheme cluster.
-fn mask(text: &str) -> String {
-    MASK_GLYPH.repeat(cluster_count(text))
+    text.graphemes(true).count()
 }
 
 impl Ui<'_> {
@@ -1265,8 +1646,8 @@ impl Ui<'_> {
     /// [`crate::Focus`] instead and pass it `focus.register()` here.
     ///
     /// `masked` swaps the displayed text (and the caret's measured position)
-    /// for [`mask`]ed dots — a password field — without touching
-    /// [`TextFieldState`] at all: the caret is still a byte offset into the
+    /// for mask glyphs and marks [`TextFieldState`] sensitive for Debug and
+    /// buffer replacement without changing its stored text. The caret is still a byte offset into the
     /// real text and still only ever lands on a cluster boundary, so masking
     /// cannot desynchronise it from what backspace or the arrow keys do. The
     /// placeholder is shown in the clear either way; it is a label ("PIN"),
@@ -1279,11 +1660,86 @@ impl Ui<'_> {
         focused: bool,
         masked: bool,
     ) -> bool {
+        let (changed, focused) = self.text_field_input(state, area, focused, masked);
+        self.paint_text_field(state, area, placeholder, focused, masked);
+        changed
+    }
+
+    /// Claim editing/clipboard input before background widgets draw a modal overlay.
+    /// Returns `(changed, focused)`; pass that focus to `paint_text_field` once.
+    pub fn text_field_input(
+        &mut self,
+        state: &mut TextFieldState,
+        area: Rect,
+        focused: bool,
+        masked: bool,
+    ) -> (bool, bool) {
+        state.sensitive |= masked;
+        let focused = self.control_focus(area, focused);
+        state.caret_area = None;
+        let protected = masked || state.sensitive;
+        let mut changed = false;
+        while let Some(edit) = self.input.take_accessible_text_edit(area) {
+            if !protected {
+                changed |= state.apply_accessible_edit(edit);
+            }
+        }
+        let interaction_epoch = self.input.interaction_epoch();
+        changed |= state.finish_clipboard(focused, interaction_epoch);
+        if focused {
+            let modifiers = self.input.modifiers();
+            let worker = self.input.clipboard().cloned();
+            changed |= self.input.consume_keys(|keys| {
+                state.clipboard_keys(
+                    keys,
+                    modifiers,
+                    protected,
+                    worker.as_ref(),
+                    interaction_epoch,
+                )
+            });
+        }
+        (changed, focused)
+    }
+
+    /// Paint an already-claimed text field without processing its input twice.
+    pub fn paint_text_field(
+        &mut self,
+        state: &mut TextFieldState,
+        area: Rect,
+        placeholder: &str,
+        focused: bool,
+        masked: bool,
+    ) {
+        #[cfg(feature = "accessibility")]
+        if masked || state.sensitive {
+            self.semantic(
+                crate::semantics::Role::PasswordInput,
+                placeholder,
+                area,
+                focused,
+                None,
+                None,
+            );
+        } else if let Some(semantics) = self.semantics.as_deref_mut() {
+            semantics.add_text_input(
+                placeholder,
+                area,
+                focused,
+                state.text(),
+                state.selection_anchor.unwrap_or(state.caret),
+                state.caret,
+            );
+        }
         let theme = self.theme;
         self.painter.rounded_rect(
             area,
             theme.corner_radius,
-            theme.border_width,
+            if focused {
+                self.px(theme.focus_width)
+            } else {
+                theme.border_width
+            },
             theme.background,
             if focused {
                 theme.accent
@@ -1293,49 +1749,72 @@ impl Ui<'_> {
         );
 
         let inner = area.inset(theme.padding / 2);
-        if state.is_empty() && !focused {
-            self.label(inner, placeholder, theme.text_dim, Align::Left);
-        } else if masked {
-            self.label(inner, &mask(state.text()), theme.text, Align::Left);
-        } else {
-            self.label(inner, state.text(), theme.text, Align::Left);
+        if masked {
+            state.refresh_mask();
         }
-
+        let display = if masked {
+            state.masked_display.as_str()
+        } else {
+            state.text.as_str()
+        };
         if focused {
-            // A selected range reads as a highlight, measured the same way
-            // as the caret below. Ranges only ever span whole clusters —
-            // the caret and the anchor never land inside one — so slicing
-            // by these byte offsets is sound.
+            // Paint below the glyphs, using their displayed positions even in masked fields.
             if let Some((start, end)) = state.selection_range() {
                 if start != end {
-                    let x0 = inner.x + self.text.measure(&state.text()[..start], theme.body);
-                    let width = self.text.measure(&state.text()[start..end], theme.body);
+                    let (start, end) = if masked {
+                        (
+                            cluster_count(&state.text[..start]),
+                            cluster_count(&state.text[..end]),
+                        )
+                    } else {
+                        (start, end)
+                    };
+                    let x0 = inner.x + self.text.measure(&display[..start], theme.body);
+                    let width = self.text.measure(&display[start..end], theme.body);
+                    let left = x0.clamp(inner.x, inner.right());
+                    let right = (x0 + width).clamp(left, inner.right());
                     let height = self.text.line_height(theme.body);
                     let top = inner.y + (inner.h - height) / 2;
                     self.painter
-                        .fill_rect(Rect::new(x0, top, width, height), theme.selection);
+                        .fill_rect(Rect::new(left, top, right - left, height), theme.selection);
                 }
             }
+        }
+        if state.is_empty() && !focused {
+            self.label(inner, placeholder, theme.text_dim, Align::Left);
+        } else {
+            self.label(inner, display, theme.text, Align::Left);
+        }
+
+        if focused {
             // A caret drawn at the measured width of the text before it, so
             // it sits where the next glyph will land rather than at a guess.
             // Masked, that means the width of *its* dots, not of the real
             // (possibly much narrower or wider) characters they stand for.
             let before = &state.text()[..state.caret()];
             let offset = if masked {
-                self.text.measure(&mask(before), theme.body)
+                self.text
+                    .measure(&display[..cluster_count(before)], theme.body)
             } else {
                 self.text.measure(before, theme.body)
             };
             let height = self.text.line_height(theme.body);
             let top = inner.y + (inner.h - height) / 2;
+            state.caret_area = Some(Rect::new(inner.x + offset, top, self.px(2), height));
+            let composition = self.input.composition();
+            if !composition.is_empty() && !masked {
+                self.text.draw_fitted(
+                    &mut self.painter,
+                    composition,
+                    Rect::new(inner.x + offset, top, (inner.w - offset).max(0), height),
+                    top,
+                    theme.body,
+                    theme.text,
+                    Align::Left,
+                );
+            }
             self.painter
                 .fill_rect(Rect::new(inner.x + offset, top, 2, height), theme.accent);
-        }
-
-        if focused {
-            self.input.consume_keys(|keys| state.apply(keys))
-        } else {
-            false
         }
     }
 }
@@ -1344,74 +1823,98 @@ impl Ui<'_> {
 mod text_field_tests {
     use super::*;
 
-    /// Every Thai cluster boundary in a string, as byte offsets.
-    fn boundaries(text: &str) -> Vec<usize> {
-        let mut offsets = vec![0];
-        for (index, character) in text.char_indices() {
-            if index > 0 && !pixelkit_text::font::is_thai_combining(character) {
-                offsets.push(index);
-            }
-        }
-        offsets.push(text.len());
-        offsets.dedup();
-        offsets
-    }
-
-    /// A word of each awkward shape: tone on an upper vowel, below-vowel with
-    /// a tone above, sara am, and Latin mixed in.
-    const AWKWARD: &str = "น้ำพริกเผาปุ๋ยก็ ABC 12";
-
     #[test]
-    fn the_caret_only_ever_rests_on_a_cluster_boundary() {
-        // Walking right from the start, then left from the end. A caret
-        // between ก and its tone mark is a position no reader recognises,
-        // and backspacing from it changes the word rather than deleting a
-        // letter.
-        let allowed = boundaries(AWKWARD);
-
-        let mut field = TextFieldState::with_text(AWKWARD);
-        field.home();
-        let mut seen = vec![field.caret()];
-        while field.caret() < AWKWARD.len() {
-            let before = field.caret();
+    fn movement_selection_and_deletion_keep_extended_graphemes_whole() {
+        for grapheme in ["e\u{301}", "ก็", "น้ำ", "🧑🏽‍💻", "🇹🇭", "ن\u{651}", "\r\n"]
+        {
+            let mut field = TextFieldState::with_text(format!("L{grapheme}R"));
+            field.home();
             field.move_right();
-            assert!(field.caret() > before, "the caret stopped moving");
-            assert!(
-                allowed.contains(&field.caret()),
-                "rightwards, caret landed at {} which is inside a cluster",
-                field.caret()
+            field.move_right();
+            assert_eq!(field.caret(), 1 + grapheme.len(), "{grapheme:?}");
+            field.apply_with_modifiers(
+                &[KeyInput::Left],
+                pixelkit_shell::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
             );
-            seen.push(field.caret());
+            assert_eq!(field.selected_text(), Some(grapheme), "{grapheme:?}");
+            field.delete();
+            assert_eq!(field.text(), "LR", "{grapheme:?}");
+            let mut field = TextFieldState::with_text(format!("L{grapheme}"));
+            field.backspace();
+            assert_eq!(field.text(), "L", "{grapheme:?}");
+            let mut field = TextFieldState::with_text(format!("{grapheme}R"));
+            field.home();
+            field.delete();
+            assert_eq!(field.text(), "R", "{grapheme:?}");
         }
-
-        field.end();
-        while field.caret() > 0 {
-            let before = field.caret();
-            field.move_left();
-            assert!(field.caret() < before);
-            assert!(
-                allowed.contains(&field.caret()),
-                "leftwards, caret landed at {} which is inside a cluster",
-                field.caret()
-            );
-        }
-
-        // And the two directions agree about where the stops are.
-        assert_eq!(seen, allowed);
     }
 
     #[test]
-    fn backspace_removes_a_letter_rather_than_a_mark() {
-        // น้ำ is three characters and two letters. Deleting one character at
-        // a time would leave น with no tone mark — a different word, and the
-        // typist saw nothing disappear.
-        let mut field = TextFieldState::with_text("น้ำ");
-        assert_eq!(field.text().chars().count(), 3);
+    fn deletion_and_insertion_keep_caret_valid_when_neighboring_graphemes_merge() {
+        let mut field = TextFieldState::with_text("🇦x🇧");
+        field.home();
+        field.move_right();
+        field.apply_with_modifiers(
+            &[KeyInput::Right],
+            pixelkit_shell::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        field.delete_selection();
+        assert_eq!(field.text(), "🇦🇧");
+        assert_eq!(field.caret(), "🇦🇧".len());
+        field.backspace();
+        assert_eq!(field.text(), "");
 
+        let mut field = TextFieldState::with_text("🇦x🇧");
+        field.home();
+        field.move_right();
+        field.apply_with_modifiers(
+            &[KeyInput::Right],
+            pixelkit_shell::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        );
+        field.insert_str("y");
+        assert_eq!(
+            field.text(),
+            "🇦y🇧",
+            "replacement must not move after a temporary merged flag"
+        );
+        assert_eq!(field.caret(), "🇦y".len());
+
+        let mut field = TextFieldState::with_text("\u{301}R");
+        field.home();
+        field.insert('e');
+        assert_eq!(field.text(), "e\u{301}R");
+        assert_eq!(field.caret(), "e\u{301}".len());
         field.backspace();
-        assert_eq!(field.text(), "น้", "ำ is one letter");
-        field.backspace();
-        assert_eq!(field.text(), "", "and น้ is the other, mark and all");
+        assert_eq!(field.text(), "R");
+    }
+
+    #[test]
+    fn sensitive_text_transfer_redacts_and_clears_edit_state() {
+        let mut field = TextFieldState::with_text("fixture-password");
+        field.sensitive = true;
+        field.select_all();
+        assert!(!format!("{field:?}").contains("fixture-password"));
+        let mut value = field.take_text();
+        assert!(field.text().is_empty());
+        assert_eq!(field.caret(), 0);
+        assert_eq!(field.selected_text(), None);
+        zeroize::Zeroize::zeroize(&mut value);
+        field.set_text("replacement");
+        field.select_all();
+        field.clear_sensitive();
+        assert!(field.text().is_empty());
+        assert_eq!(field.caret(), 0);
+        assert_eq!(field.selected_text(), None);
+        assert!(field.caret_area().is_none());
     }
 
     #[test]
@@ -1433,43 +1936,6 @@ mod text_field_tests {
         field.backspace();
         assert_eq!(field.text(), "ข้าว");
         assert_eq!(field.caret(), 0);
-    }
-
-    #[test]
-    fn deleting_from_every_position_leaves_valid_text() {
-        // Exhaustive, because the failure is silent: the string stays valid
-        // UTF-8 and simply means something else.
-        for start in boundaries(AWKWARD) {
-            let mut field = TextFieldState::with_text(AWKWARD);
-            field.home();
-            while field.caret() < start {
-                field.move_right();
-            }
-            field.backspace();
-            // The caret must sit at a cluster boundary, which is about what
-            // is to its *right*: a mark there has been separated from the
-            // base it belongs to. A mark to its left is ordinary — that is
-            // simply the end of a complete cluster, which น้ is.
-            assert!(
-                !field.text()[field.caret()..]
-                    .chars()
-                    .next()
-                    .is_some_and(pixelkit_text::font::is_thai_combining),
-                "backspacing at {start} left the caret inside a cluster: {:?}",
-                field.text()
-            );
-            // Whatever remains must not begin with a combining mark, which
-            // would be a mark with no base to attach to.
-            assert!(
-                !field
-                    .text()
-                    .chars()
-                    .next()
-                    .is_some_and(pixelkit_text::font::is_thai_combining),
-                "backspacing at {start} left {:?} starting with a mark",
-                field.text()
-            );
-        }
     }
 
     #[test]
@@ -1640,6 +2106,184 @@ mod masked_text_field_tests {
 
     fn area() -> Rect {
         Rect::new(0, 0, 200, 30)
+    }
+
+    fn edit_frame(state: &mut TextFieldState, input: &mut Input, masked: bool) -> bool {
+        let mut buffer = WindowBuffer::new(200, 30);
+        let mut text = TextCache::new(set());
+        let mut kernel = RasterKernel::new();
+        Ui::new(
+            Painter::new(&mut buffer),
+            &mut text,
+            input,
+            Theme::default(),
+            Scale::ONE,
+            &mut kernel,
+        )
+        .text_field(state, area(), "Fixture field", true, masked)
+    }
+
+    #[test]
+    fn accessible_value_and_selection_batch_replaces_only_whole_graphemes() {
+        use pixelkit_shell::input::AccessibleTextEdit;
+        let value = "Le\u{301}🧑🏽‍💻R";
+        let end = value.len() - 1;
+        for reverse in [false, true] {
+            let mut state = TextFieldState::with_text("old");
+            let mut input = Input::new();
+            input.set_accessible_text_edit(area(), AccessibleTextEdit::SetValue(value.into()));
+            let (anchor, focus) = if reverse { (end, 3) } else { (3, end) };
+            input.set_accessible_text_edit(
+                area(),
+                AccessibleTextEdit::SetSelection { anchor, focus },
+            );
+            assert!(edit_frame(&mut state, &mut input, false));
+            assert_eq!(state.selected_text(), Some("e\u{301}🧑🏽‍💻"));
+            assert_eq!(state.caret(), if reverse { 1 } else { end });
+            input.end_frame();
+            input.key(KeyInput::Character('X'));
+            assert!(edit_frame(&mut state, &mut input, false));
+            assert_eq!(state.text(), "LXR");
+            assert_eq!(state.caret(), 2);
+        }
+    }
+
+    #[test]
+    fn expired_accessible_edit_cannot_modify_same_position_replacement_field() {
+        use pixelkit_shell::input::AccessibleTextEdit;
+        for boundary in 0..3 {
+            let mut input = Input::new();
+            input.set_accessible_text_edit(
+                area(),
+                AccessibleTextEdit::SetValue("retired field".into()),
+            );
+            match boundary {
+                0 => input.end_frame(),
+                1 => input.blur(),
+                _ => input.clear_accessible_text_edit(),
+            }
+            let mut replacement = TextFieldState::with_text("current field");
+            assert!(!edit_frame(&mut replacement, &mut input, false));
+            assert_eq!(replacement.text(), "current field");
+            assert_eq!(replacement.caret(), "current field".len());
+        }
+    }
+
+    #[test]
+    fn password_rejects_plain_accessible_edits_even_while_visually_revealed() {
+        use pixelkit_shell::input::AccessibleTextEdit;
+        let mut state = TextFieldState::with_text("secret fixture");
+        let mut input = Input::new();
+        edit_frame(&mut state, &mut input, true);
+        for masked in [true, false] {
+            input.set_accessible_text_edit(
+                area(),
+                AccessibleTextEdit::SetValue("replacement".into()),
+            );
+            input.set_accessible_text_edit(
+                area(),
+                AccessibleTextEdit::SetSelection {
+                    anchor: 0,
+                    focus: usize::MAX,
+                },
+            );
+            assert!(!edit_frame(&mut state, &mut input, masked));
+            assert_eq!(state.text(), "secret fixture");
+            assert!(!state.has_selection());
+            assert_eq!(state.caret(), "secret fixture".len());
+            input.end_frame();
+        }
+    }
+
+    #[test]
+    fn scaled_text_glyphs_and_caret_follow_the_same_device_density() {
+        let mut baseline_height = None;
+        for factor in [1.0, 1.25, 1.5, 2.0] {
+            let scale = Scale(factor);
+            let area = Rect::new(0, 0, scale.px(200), scale.px(36));
+            let mut buffer = WindowBuffer::new(area.w as u32, area.h as u32);
+            let mut text = TextCache::new(set());
+            let mut kernel = RasterKernel::new();
+            let mut input = Input::new();
+            let mut field = TextFieldState::with_text("Density");
+            let theme = Theme {
+                background: 0,
+                text: 0xff_ffff,
+                accent: 0x22_4466,
+                body: TextStyle::new(FaceId(0), 18.0),
+                ..Theme::default()
+            };
+            Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                theme,
+                scale,
+                &mut kernel,
+            )
+            .text_field(&mut field, area, "", true, false);
+            let expected = theme.body.with_size(18.0 * factor);
+            let caret = field.caret_area().expect("focused text caret");
+            assert_eq!(
+                caret.x,
+                area.inset(theme.padding / 2).x + text.measure("Density", expected)
+            );
+            assert_eq!(caret.h, text.line_height(expected));
+            let bright_rows: Vec<_> = buffer
+                .pixels
+                .chunks(buffer.width as usize)
+                .enumerate()
+                .filter(|(_, row)| {
+                    row.iter().any(|pixel| {
+                        (pixel >> 16 & 0xff) > 200
+                            && (pixel >> 8 & 0xff) > 200
+                            && (pixel & 0xff) > 200
+                    })
+                })
+                .map(|(y, _)| y as i32)
+                .collect();
+            let height = bright_rows.last().expect("visible glyphs") - bright_rows[0] + 1;
+            let baseline = *baseline_height.get_or_insert(height);
+            assert!(
+                (height as f32 - baseline as f32 * factor).abs() <= 2.0,
+                "glyph height {height} did not follow density {factor} from {baseline}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_plain_text_and_password_mask_remain_readable() {
+        for masked in [false, true] {
+            let mut buffer = WindowBuffer::new(200, 30);
+            let mut text = TextCache::new(set());
+            let mut kernel = RasterKernel::new();
+            let mut input = Input::new();
+            let mut state = TextFieldState::with_text("Readable");
+            state.select_all();
+            let theme = Theme {
+                background: 0x11_2233,
+                text: 0xff_ffff,
+                selection: 0x22_4466,
+                accent: 0x22_4466,
+                ..Theme::default()
+            };
+            Ui::new(
+                Painter::new(&mut buffer),
+                &mut text,
+                &mut input,
+                theme,
+                Scale::ONE,
+                &mut kernel,
+            )
+            .text_field(&mut state, area(), "", true, masked);
+            assert!(
+                buffer.pixels.iter().any(|pixel| (pixel >> 16 & 0xff) > 200
+                    && (pixel >> 8 & 0xff) > 200
+                    && (pixel & 0xff) > 200),
+                "selected {} glyphs were covered by their highlight",
+                if masked { "mask" } else { "text" }
+            );
+        }
     }
 
     fn render(text: &str, masked: bool, focused: bool) -> WindowBuffer {
@@ -2073,5 +2717,67 @@ mod gutter_tests {
             cell_left.push(widths);
         }
         assert_eq!(cell_left[0], cell_left[1]);
+    }
+}
+
+#[cfg(test)]
+mod clipboard_interaction_tests {
+    use super::*;
+    use pixelkit_shell::Modifiers;
+
+    #[test]
+    fn clipboard_shortcut_never_inserts_its_letter_on_failure() {
+        let mut state = TextFieldState::with_text("ชื่อ");
+        assert!(!state.clipboard_keys(
+            &[KeyInput::Character('v')],
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            false,
+            None,
+            0
+        ));
+        assert_eq!(state.text(), "ชื่อ");
+        assert_eq!(
+            state.clipboard_error(),
+            Some("system clipboard not attached")
+        );
+    }
+
+    #[test]
+    fn masked_copy_and_cut_never_reach_clipboard_or_delete_text() {
+        let mut state = TextFieldState::with_text("secret");
+        state.select_all();
+        for key in ['c', 'x'] {
+            assert!(!state.clipboard_keys(
+                &[KeyInput::Character(key)],
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+                true,
+                None,
+                0
+            ));
+        }
+        assert_eq!(state.text(), "secret");
+        assert_eq!(state.clipboard_error(), None);
+    }
+
+    #[test]
+    fn shift_selection_preserves_thai_cluster_boundaries() {
+        let mut state = TextFieldState::with_text("aก็");
+        state.apply_with_modifiers(
+            &[KeyInput::Left],
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        assert_eq!(state.selected_text(), Some("ก็"));
+        state.insert_str("ชื่อ😀.txt");
+        assert_eq!(state.text(), "aชื่อ😀.txt");
+        assert_eq!(state.caret(), state.text().len());
     }
 }

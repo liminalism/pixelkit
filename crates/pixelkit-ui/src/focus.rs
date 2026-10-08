@@ -101,10 +101,9 @@ impl Focus {
         // field removed since then does not leave focus pointing miles past
         // the end of a much shorter list — the same clamp `Ui::tabs` applies
         // to its own selection index.
-        if self.count == 0 {
-            self.current = None;
-        } else if let Some(index) = self.current {
-            self.current = Some(index.min(self.count - 1));
+        // An explicit set before the first registration must survive this frame.
+        if self.count > 0 {
+            self.current = self.current.map(|index| index.min(self.count - 1));
         }
         for key in keys {
             if matches!(key, KeyInput::Tab) {
@@ -140,6 +139,16 @@ impl Focus {
         self.registered += 1;
         self.count = self.registered;
         self.current == Some(index)
+    }
+
+    /// Register a control and acquire focus on a pointer press or an
+    /// accessibility focus request, before the widget consumes its click.
+    pub fn register_at(&mut self, input: &pixelkit_shell::Input, area: pixelkit_raster::Rect) -> bool {
+        if input.press_position().is_some_and(|(x, y)| area.contains(x, y))
+            || input.focus_requested(area) {
+            self.current = Some(self.registered);
+        }
+        self.register()
     }
 
     /// Give a specific registration focus outright — a click on a field

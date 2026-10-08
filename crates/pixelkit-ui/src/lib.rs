@@ -7,10 +7,13 @@
 pub mod chrome;
 pub mod dropdown;
 pub mod focus;
+#[cfg(feature = "accessibility")]
+pub mod semantics;
 pub mod form;
 pub mod layout;
 pub mod list;
 pub mod palette;
+pub mod toast;
 pub mod tooltip;
 pub mod widget;
 
@@ -21,6 +24,10 @@ pub use form::{CHECKBOX_SIZE, RADIO_SIZE, TOGGLE_SIZE};
 pub use layout::{columns_per_row, grid, grid_content_height, grid_item, grid_visible_range};
 pub use list::{ScrollList, ScrollState};
 pub use palette::{Appearance, OperationalPalette};
+pub use toast::{
+    TOAST_MAX_ACTIONS, TOAST_MAX_BODY_LINES, TOAST_WIDTH, ToastAction, ToastCard, ToastLayout,
+    ToastOutcome, toast_layout,
+};
 pub use tooltip::Tooltip;
 pub use tooltip::TooltipStyle;
 pub use widget::{

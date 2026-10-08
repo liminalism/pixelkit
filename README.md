@@ -25,11 +25,18 @@
 |---|---|---|
 | [`pixelkit-raster`](crates/pixelkit-raster) | Pixel buffers, painter, analytic path coverage, bitmap scaling and PNG decode/encode | None |
 | [`pixelkit-text`](crates/pixelkit-text) | TrueType parsing, OpenType shaping, glyph rasterization, wrapping and text cache | `pixelkit-raster` |
-| [`pixelkit-shell`](crates/pixelkit-shell) | Per-frame input, scale handling, frame presentation and clipboard | `winit`, `softbuffer`, `pixelkit-raster` |
-| [`pixelkit-ui`](crates/pixelkit-ui) | Immediate-mode widgets and layout utilities | `pixelkit-raster`, `pixelkit-text`, `pixelkit-shell` |
+| [`pixelkit-shell`](crates/pixelkit-shell) | Per-frame input, scale handling, presentation interfaces and native clipboard | `pixelkit-raster`, `zeroize`, platform clipboard libraries |
+| [`pixelkit-ui`](crates/pixelkit-ui) | Immediate-mode widgets, layout and grapheme-safe editing | `pixelkit-raster`, `pixelkit-text`, `pixelkit-shell`, `unicode-segmentation`, `zeroize`; optional AccessKit |
 | [`pixelkit-windowing`](crates/pixelkit-windowing) | OS window hosting, draggable panes and floating windows | `winit`, `softbuffer`, `pixelkit-raster`, `pixelkit-shell` |
 
-The raster, text, and UI crates have no third-party runtime dependencies of their own. The shell and windowing crates use `winit` and `softbuffer`; windowing's optional `accessibility` feature enables AccessKit support. On macOS, clipboard and platform helpers use safe `objc2` wrappers. Applications provide and embed their own production fonts.
+The raster and text core are independent of the native window host. UI uses `unicode-segmentation` for extended-grapheme editing and `zeroize` for sensitive state; its optional `accessibility` feature collects AccessKit semantics. Shell owns input and native clipboard primitives. `winit` and `softbuffer` belong to windowing, whose optional `accessibility` feature supplies the platform adapter. On macOS, clipboard and platform helpers use safe `objc2` wrappers. Applications provide and embed their own production fonts.
+
+`pixelkit-ui::Theme` font sizes are logical when passed to `Ui::new`; the UI's theme copy converts
+body and heading sizes to device pixels once. Dimensional theme tokens still use `Ui::px`.
+Explicit `label_styled` styles remain device-pixel styles, matching `pixelkit-text::TextStyle`;
+convert a custom logical style with `Ui::text_style` before both measurement and drawing.
+Do not rescale `Ui::theme.body` or `Ui::theme.heading`, or reuse that effective theme as a
+logical theme when constructing another scaled UI. Keep the application's unscaled theme instead.
 
 ## Requirements
 
@@ -98,19 +105,30 @@ The implementation targets the TrueType outlines and OpenType substitutions and 
 
 ### `pixelkit-shell`
 
-`Input` collects a frame's worth of cursor, button, wheel, and key activity for immediate-mode widgets to claim. `Scale` converts the logical pixels layout is written in to physical pixels. `Presenter` is the seam a finished buffer crosses to reach the screen, with a `softbuffer` implementation built in. `FrameTimer` logs paint-phase timings. Clipboard helpers use the system pasteboard on macOS and an in-memory fallback elsewhere.
+`Input` collects a frame's worth of cursor, button, wheel and key activity. `Scale` converts logical layout to physical pixels. `Presenter` carries a frame to the screen; `FrameTimer` logs timing. Clipboard uses NSPasteboard on macOS and arboard 3.6.1 on Linux (X11 selections or Wayland wlr data-control), retaining ownership for the handle's lifetime. Unavailable transport is a real error, never successful local-only copy. Other unsupported platforms report unavailable. The local fake is explicitly test-only.
+
+For event-loop-compatible clipboard delivery, create `clipboard::ClipboardWorker::new(move || waker.wake())` in `PixelApp::attach` and pass it to `Input::attach_clipboard`. The bounded worker serializes operations and preserves the native owner. `try_set_text`/`try_text`/`try_clear` expose failures; the older boolean/optional convenience methods still use the real transport. The permanent `clipboard_peer` example supports `set TEXT HOLD_MS` and `get` in separate processes on an explicitly chosen private display; it is not a simulated clipboard test.
 
 ### `pixelkit-windowing`
 
 `PixelApp` exposes hooks for drawing, ticks, keyboard events, IME input, cursor and mouse events, scrolling, magnification, theme changes, and exit handling. The host translates platform events into these hooks, tracks physical and logical scale, and presents the software-rendered buffer. `Waker` can request a redraw. `run_app` runs one window; `run_windows` runs several, each with its own application, and applications can open or close windows at runtime through `poll_window`.
 
+Printable key text is committed in full, including a platform `NamedKey::Space`
+event carrying `" "`. Navigation keys, Tab and Enter remain key actions rather than
+inserting their platform control-text payloads into a text field.
+
+`run_window_service(start, incoming)` is the same host with a persistent idle lifetime: construct it once on the process main thread, give the producer its `Waker` in `start`, and build new applications on the main thread in `incoming`. Every request closes only its own window through `WindowRequest::Close`. `on_host_error` separates creation/presentation failure from user close; startup activation tokens are per-window attributes, not process-global environment changes.
+
 `Panes` tiles a region with draggable dividers: every interior edge resizes the panes on both sides. `Windows` manages floating windows that move by their title bars, resize by their edges and corners, raise on press, and report close-button presses. Both are caller-owned state updated once a frame before drawing.
 
-Enable `accessibility` on `pixelkit-windowing` to publish an application-supplied AccessKit tree and receive accessibility actions. The widgets do not automatically construct a semantic accessibility tree; applications that enable this feature provide that tree through the app hook.
+Enable `accessibility` on `pixelkit-windowing` for the platform AccessKit adapter, including AT-SPI on Linux. Enable `pixelkit-ui/accessibility` and opt into `Ui::with_semantics` to collect labels, roles, checked states, physical bounds and focus from the existing controls. `Semantics::begin` assigns never-reused frame IDs, so a delayed action cannot activate a substituted same-position control. `begin_scoped(title, epoch)` can preserve unchanged role/label IDs only when the application guarantees the same logical rows, page and geometry within that epoch; otherwise use the conservative default. Call `invalidate()` before identity/layout changes, including the host's `on_layout_changed` callback. Actions must target the ROOT tree and an exact live ID, not a draw-order index. `Semantics::update` supplies the app hook; `Semantics::action` uses existing Input/Focus. Record nodes only while accessibility is active, ending that lifetime in `on_accessibility_deactivated`. Complete screen-reader text editing and semantic coverage for every widget/application are not claimed.
 
 ### `pixelkit-ui`
 
 Widgets draw immediately into a caller-provided `Ui`; there is no retained widget tree or global identity map. Keep persistent state such as selected rows, text field contents, dropdown state, and scroll offsets in the application. Tables support keyed selection and only draw visible rows. Scroll lists draw only rows intersecting their viewport. Layout helpers calculate flow-grid cells and visible ranges without requiring a UI runtime.
+
+`Ui::text_field` applies committed input and async clipboard results before painting. Ctrl+A/C/X/V and Shift navigation use the same `TextFieldState`; masked fields never copy or cut their contents. Failed copies never delete selected text; late replies after an edit or focus loss are discarded. Applications can show `clipboard_error()` inline. Deliver the entire committed `KeyEvent.text`, avoiding a duplicate legacy first-character callback; `Input::set_composition` paints IME preedit, and `TextFieldState::caret_area()` returns the physical candidate anchor. Editing and password masks use Unicode extended-grapheme boundaries without normalizing stored UTF-8, including neighboring clusters changed by insertion or selection replacement. Glyph shaping and font coverage remain separate: the focused TrueType Latin/Thai stack is not full Unicode glyph or shaping coverage.
+Override `PixelApp::ime_allowed()` using actual text focus (for example, whether the caret anchor exists); its default preserves legacy IME behavior. The host applies the current candidate anchor after rendering, not the previous frame's caret.
 
 `Theme` contains semantic colors and sizing. `OperationalPalette` provides a shared appearance vocabulary, and individual controls can also be styled directly. Tooltips are requested while drawing controls and drawn after the rest of the screen so they appear above other content.
 

@@ -56,6 +56,21 @@ pub fn blend_coverage_span(destination: &mut [u32], color: u32, coverage: &[u8])
     }
 }
 
+/// Source-over an RGB colour with coverage onto a premultiplied ARGB destination.
+/// Unlike the XRGB kernel, the alpha lane is accumulated and RGB never exceeds alpha.
+#[inline]
+pub(crate) fn blend_premultiplied(destination: u32, color: u32, coverage: u8) -> u32 {
+    let alpha = u32::from(coverage);
+    let inverse = 255 - alpha;
+    let channel = |shift: u32| -> u32 {
+        let destination = (destination >> shift) & 255_u32;
+        let source = (color >> shift) & 255_u32;
+        (source * alpha + destination * inverse + 127) / 255
+    };
+    let out_alpha = alpha + (((destination >> 24) * inverse + 127) / 255);
+    (out_alpha << 24) | (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
+
 /// Merge coverage in, keeping the greater value.
 ///
 /// `max` rather than adding: two overlapping contours of the same glyph — a

@@ -25,6 +25,32 @@ struct Open {
     /// Physical rect of the closed field, so the popup knows where to hang.
     field: Rect,
     options: Vec<String>,
+    selected: usize,
+    /// A queued opening key may already have applied the popup's remaining keys.
+    /// Picking still reports through `draw`, including for `Ui::dropdown` callers.
+    pending_keys: Option<(Option<usize>, bool)>,
+}
+
+impl Open {
+    /// Apply popup keys in order, stopping when it picks or dismisses.
+    fn handle_keys(&mut self, keys: &[KeyInput]) -> (Option<usize>, bool) {
+        for key in keys {
+            match key {
+                KeyInput::Up if !self.options.is_empty() => {
+                    self.selected = (self.selected + self.options.len() - 1) % self.options.len();
+                }
+                KeyInput::Down if !self.options.is_empty() => {
+                    self.selected = (self.selected + 1) % self.options.len();
+                }
+                KeyInput::Enter if !self.options.is_empty() => {
+                    return (Some(self.selected), true);
+                }
+                KeyInput::Escape | KeyInput::Tab => return (None, true),
+                _ => {}
+            }
+        }
+        (None, false)
+    }
 }
 
 impl Dropdown {
@@ -46,11 +72,17 @@ impl Dropdown {
     /// Escape, or on a click that lands inside `bounds` but on none of the
     /// options — the same "click outside dismisses it" a real menu has.
     pub fn draw(&mut self, ui: &mut Ui<'_>, bounds: Rect) -> Option<usize> {
-        let Some(open) = &self.open else {
+        let Some(open) = &mut self.open else {
             return None;
         };
+        #[cfg(feature = "accessibility")]
+        ui.modal_semantics();
+        let (mut picked, dismissed_by_key) = match open.pending_keys.take() {
+            Some(result) => result,
+            None => ui.input.consume_keys(|keys| open.handle_keys(keys)),
+        };
         let theme = ui.theme;
-        let row_h = theme.row_height;
+        let row_h = ui.px(theme.row_height);
         let total_h = row_h * open.options.len() as i32;
         let below = Rect::new(open.field.x, open.field.bottom(), open.field.w, total_h);
         let fits_above = open.field.y - total_h >= bounds.y;
@@ -71,10 +103,21 @@ impl Dropdown {
             theme.panel_edge,
         );
 
-        let mut picked = None;
         for (index, label) in open.options.iter().enumerate() {
             let row = Rect::new(rect.x, rect.y + row_h * index as i32, rect.w, row_h);
-            if ui.input.hovering(row) {
+            if ui.input.focus_requested(row) {
+                open.selected = index;
+            }
+            #[cfg(feature = "accessibility")]
+            ui.semantic(
+                crate::semantics::Role::MenuListOption,
+                label,
+                row,
+                index == open.selected,
+                Some(index == open.selected),
+                None,
+            );
+            if ui.input.hovering(row) || index == open.selected {
                 ui.painter.fill_rect(row, theme.hover);
             }
             ui.label(row.inset(theme.padding / 2), label, theme.text, Align::Left);
@@ -88,13 +131,10 @@ impl Dropdown {
         // elsewhere — dismisses the popup rather than being left pending
         // for something behind it to react to next frame.
         let dismissed_by_click = ui.input.take_click(bounds);
-        let dismissed_by_escape = ui
-            .input
-            .keys()
-            .iter()
-            .any(|key| matches!(key, KeyInput::Escape));
-        if picked.is_some() || dismissed_by_click || dismissed_by_escape {
+        if picked.is_some() || dismissed_by_click || dismissed_by_key {
             self.open = None;
+            #[cfg(feature = "accessibility")]
+            ui.modal_semantics();
         }
         picked
     }
@@ -111,7 +151,71 @@ impl Ui<'_> {
         options: &[&str],
         selected: usize,
     ) -> bool {
+        self.dropdown_with_focus(dropdown, area, options, selected, false, false)
+            .0
+    }
+    fn dropdown_with_focus(
+        &mut self,
+        dropdown: &mut Dropdown,
+        area: Rect,
+        options: &[&str],
+        selected: usize,
+        focused: bool,
+        cycle_closed: bool,
+    ) -> (bool, Option<usize>) {
+        let focused = self.control_focus(area, focused);
+        let mut selected = selected.min(options.len().saturating_sub(1));
+        let mut picked = None;
+        let mut clicked = self.input.take_click(area);
+        if clicked {
+            if dropdown.is_open() {
+                dropdown.close();
+            } else {
+                dropdown.open = Some(Open {
+                    field: area,
+                    options: options.iter().map(|s| s.to_string()).collect(),
+                    selected,
+                    pending_keys: None,
+                });
+            }
+        } else if focused && !dropdown.is_open() {
+            self.input.consume_keys(|keys| {
+                for (position, key) in keys.iter().enumerate() {
+                    let delta = match key {
+                        KeyInput::Up | KeyInput::Left if cycle_closed => -1,
+                        KeyInput::Down | KeyInput::Right if cycle_closed => 1,
+                        _ => 0,
+                    };
+                    if delta != 0 && !options.is_empty() {
+                        selected =
+                            (selected as i32 + delta).rem_euclid(options.len() as i32) as usize;
+                        picked = Some(selected);
+                    }
+                    if matches!(key, KeyInput::Enter | KeyInput::Character(' ')) {
+                        clicked = true;
+                        let mut open = Open {
+                            field: area,
+                            options: options.iter().map(|s| s.to_string()).collect(),
+                            selected,
+                            pending_keys: None,
+                        };
+                        open.pending_keys = Some(open.handle_keys(&keys[position + 1..]));
+                        dropdown.open = Some(open);
+                        break;
+                    }
+                }
+            });
+        }
         let theme = self.theme;
+        #[cfg(feature = "accessibility")]
+        self.semantic(
+            crate::semantics::Role::ComboBox,
+            options.get(selected).copied().unwrap_or(""),
+            area,
+            focused,
+            None,
+            None,
+        );
         let open = dropdown.is_open();
         let hovered = self.input.hovering(area);
         let fill = if open {
@@ -124,9 +228,17 @@ impl Ui<'_> {
         self.painter.rounded_rect(
             area,
             theme.corner_radius,
-            theme.border_width,
+            if focused {
+                self.px(theme.focus_width)
+            } else {
+                theme.border_width
+            },
             fill,
-            theme.panel_edge,
+            if focused {
+                theme.accent
+            } else {
+                theme.panel_edge
+            },
         );
 
         let chevron_w = self.px(20);
@@ -135,18 +247,22 @@ impl Ui<'_> {
         self.label(label_area, label, theme.text, Align::Left);
         self.draw_chevron(chevron_area, open, theme.text_dim);
 
-        let clicked = self.input.take_click(area);
-        if clicked {
-            if open {
-                dropdown.close();
-            } else {
-                dropdown.open = Some(Open {
-                    field: area,
-                    options: options.iter().map(|s| s.to_string()).collect(),
-                });
-            }
-        }
-        clicked
+        (clicked, picked)
+    }
+
+    /// Keyboard focus cycles the same choices that the pointer popup offers.
+    /// Enter/Space opens it; later keys in the same frame belong to the popup.
+    /// Returns a newly selected index; popup clicks still come from `draw`.
+    pub fn dropdown_focused(
+        &mut self,
+        dropdown: &mut Dropdown,
+        area: Rect,
+        options: &[&str],
+        selected: usize,
+        focused: bool,
+    ) -> Option<usize> {
+        self.dropdown_with_focus(dropdown, area, options, selected, focused, true)
+            .1
     }
 
     /// A small up/down chevron, `open` picking which way it points.
@@ -178,8 +294,8 @@ mod tests {
     use crate::widget::Theme;
     use pixelkit_raster::{Painter, RasterKernel, WindowBuffer};
     use pixelkit_shell::{Input, MouseButton, Scale};
-    use pixelkit_text::font::test_fonts::set;
     use pixelkit_text::TextCache;
+    use pixelkit_text::font::test_fonts::set;
 
     struct Harness {
         buffer: WindowBuffer,
@@ -350,5 +466,50 @@ mod tests {
         h.input.end_frame();
         let picked = h.frame(|ui| dropdown.draw(ui, Rect::new(0, 0, 200, 200)));
         assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn queued_keyboard_pick_is_reported_by_the_plain_dropdown_popup() {
+        let mut h = Harness::new();
+        let mut dropdown = Dropdown::new();
+        let mut focus = crate::Focus::new();
+        focus.set(0);
+        for key in [KeyInput::Enter, KeyInput::Down, KeyInput::Enter] {
+            h.input.key(key);
+        }
+        let mut ui = Ui::new(
+            Painter::new(&mut h.buffer),
+            &mut h.text,
+            &mut h.input,
+            Theme::default(),
+            Scale::ONE,
+            &mut h.kernel,
+        )
+        .with_focus(&mut focus);
+        assert!(ui.dropdown(&mut dropdown, field(), &options(), 0));
+        assert_eq!(dropdown.draw(&mut ui, Rect::new(0, 0, 200, 200)), Some(1));
+        assert!(!dropdown.is_open());
+    }
+
+    #[test]
+    fn queued_closed_arrows_precede_popup_navigation_and_selection() {
+        let mut h = Harness::new();
+        let mut dropdown = Dropdown::new();
+        for key in [
+            KeyInput::Right,
+            KeyInput::Enter,
+            KeyInput::Down,
+            KeyInput::Enter,
+        ] {
+            h.input.key(key);
+        }
+        h.frame(|ui| {
+            assert_eq!(
+                ui.dropdown_focused(&mut dropdown, field(), &options(), 0, true),
+                Some(1)
+            );
+            assert_eq!(dropdown.draw(ui, Rect::new(0, 0, 200, 200)), Some(2));
+        });
+        assert!(!dropdown.is_open());
     }
 }

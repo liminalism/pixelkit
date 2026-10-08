@@ -2,6 +2,8 @@
 //!
 //! - [`host`]: the OS window host — the event loop, [`PixelApp`], and the
 //!   [`run_app`]/[`run_windows`] runners for one window or several.
+//! - [`present`]: the native softbuffer presenter; the generic Presenter seam
+//!   stays in `pixelkit-shell`, so UI/compositor users do not import winit.
 //! - [`panes`]: tiled in-app panes with draggable dividers.
 //! - [`windows`]: floating in-app windows that move, resize, raise and close.
 //!
@@ -18,9 +20,11 @@
 pub mod host;
 pub mod panes;
 pub mod windows;
+pub mod present;
+pub use present::SoftbufferPresenter;
 
 pub use host::{
-    run_app, run_app_with_presenter, run_windows, run_windows_with_presenter, CursorShape,
+    run_app, run_app_with_presenter, run_window_service, run_windows, run_windows_with_presenter, CursorShape,
     GesturePhase, ImeCursorArea, ImeEvent, KeyEvent, MultiPresenterFactory, PixelApp,
     PresenterFactory, ScrollEvent, Wake, Waker, WindowConfig, WindowRequest,
 };

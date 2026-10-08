@@ -1,4 +1,4 @@
-//! A software painter over a plain `u32` XRGB buffer.
+//! A software painter over a plain `u32` buffer: default XRGB or opt-in premultiplied ARGB.
 //!
 //! Deliberately small: rectangles, rules, text and a clip stack. A cashier
 //! screen is a handful of panels and a lot of legible type, and every pixel of
@@ -11,7 +11,9 @@
 //! nested clip intersects rather than replaces, so a child can never escape
 //! its parent.
 
-/// The window's pixels, XRGB, row-major.
+/// The window's pixels, row-major. [`Painter::new`] writes XRGB;
+/// [`Painter::new_premultiplied`] writes premultiplied ARGB with coverage in the top byte.
+/// The presenter must interpret the buffer with the same mode as its painter.
 #[derive(Debug, Clone)]
 pub struct WindowBuffer {
     pub width: u32,
@@ -126,6 +128,8 @@ impl Rect {
 
 pub struct Painter<'a> {
     buffer: &'a mut WindowBuffer,
+    /// Opt-in premultiplied ARGB storage. RGB drawing APIs still take ordinary RGB colours.
+    premultiplied: bool,
     /// The region drawing is confined to. Every write goes through it, so a
     /// scrolled row half outside its viewport is cut rather than drawn over
     /// the panel below.
@@ -149,11 +153,23 @@ impl<'a> Painter<'a> {
         let clip = Rect::new(0, 0, buffer.width as i32, buffer.height as i32);
         Painter {
             buffer,
+            premultiplied: false,
             clip,
             saved_inline: [Rect::default(); INLINE_CLIP_DEPTH],
             saved_overflow: Vec::new(),
             saved_depth: 0,
         }
+    }
+
+    /// Paint premultiplied `0xAARRGGBB` for an alpha-capable native presenter.
+    /// RGB fills are opaque; use `erase_rect` for genuinely transparent ground.
+    pub fn new_premultiplied(buffer: &'a mut WindowBuffer) -> Painter<'a> {
+        Painter { premultiplied: true, ..Self::new(buffer) }
+    }
+
+    /// Replace pixels with transparent black, including any previously painted objects.
+    pub fn erase_rect(&mut self, rect: Rect) {
+        self.fill_raw(rect, 0);
     }
 
     /// Confine drawing to the intersection of `rect` and the current clip.
@@ -222,7 +238,8 @@ impl<'a> Painter<'a> {
     #[inline]
     pub fn put(&mut self, x: i32, y: i32, color: u32) {
         if self.clip.contains(x, y) {
-            self.buffer.pixels[y as usize * self.buffer.width as usize + x as usize] = color;
+            self.buffer.pixels[y as usize * self.buffer.width as usize + x as usize] =
+                if self.premultiplied { color | 0xff00_0000 } else { color };
         }
     }
 
@@ -243,7 +260,11 @@ impl<'a> Painter<'a> {
             return;
         }
         let index = y as usize * self.buffer.width as usize + x as usize;
-        self.buffer.pixels[index] = blend_channels(self.buffer.pixels[index], color, alpha);
+        self.buffer.pixels[index] = if self.premultiplied {
+            crate::blend::blend_premultiplied(self.buffer.pixels[index], color, alpha)
+        } else {
+            blend_channels(self.buffer.pixels[index], color, alpha)
+        };
     }
 
     /// Blend one colour along a row, weighted per pixel by a coverage byte.
@@ -271,14 +292,22 @@ impl<'a> Painter<'a> {
         // The clip is only ever intersected, never replaced, so it is still
         // inside the buffer and these indices are too.
         let left = y as usize * self.buffer.width as usize + (x + start as i32) as usize;
-        crate::blend::blend_coverage_span(
-            &mut self.buffer.pixels[left..left + (end - start)],
-            color,
-            &coverage[start..end],
-        );
+        let destination = &mut self.buffer.pixels[left..left + (end - start)];
+        if self.premultiplied {
+            for (pixel, &coverage) in destination.iter_mut().zip(&coverage[start..end]) {
+                *pixel = crate::blend::blend_premultiplied(*pixel, color, coverage);
+            }
+        } else {
+            crate::blend::blend_coverage_span(destination, color, &coverage[start..end]);
+        }
     }
 
     pub fn fill_rect(&mut self, rect: Rect, color: u32) {
+        let color = if self.premultiplied { color | 0xff00_0000 } else { color };
+        self.fill_raw(rect, color);
+    }
+
+    fn fill_raw(&mut self, rect: Rect, color: u32) {
         let visible = rect.intersect(self.clip);
         if visible.is_empty() {
             return;
@@ -392,6 +421,60 @@ fn blend_channels(destination: u32, source: u32, alpha: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn premultiplied_glyph_coverage_keeps_alpha_and_composes_without_a_fringe() {
+        let coverage = [0, 1, 64, 128, 254, 255];
+        let mut buffer = WindowBuffer::new(6, 2);
+        {
+            let mut painter = Painter::new_premultiplied(&mut buffer);
+            painter.blend_coverage_row(0, 0, 0x00ff_ffff, &coverage);
+            for (x, alpha) in coverage.into_iter().enumerate() {
+                painter.blend(x as i32, 1, 0x00ff_ffff, alpha);
+            }
+        }
+        for (x, alpha) in coverage.into_iter().enumerate() {
+            let expected = u32::from(alpha) * 0x0101_0101;
+            assert_eq!(buffer.pixels[x], expected);
+            assert_eq!(buffer.pixels[6 + x], expected, "scalar and glyph spans agree");
+        }
+        Painter::new_premultiplied(&mut buffer).blend(3, 0, 0xff0000, 128);
+        assert_eq!(buffer.pixels[3], 0xc0c0_4040, "source-over accumulates premultiplied RGB and alpha");
+    }
+
+    #[test]
+    fn premultiplied_fills_are_opaque_and_erasure_replaces_objects_with_zero() {
+        let mut buffer = WindowBuffer::new(4, 3);
+        {
+            let mut painter = Painter::new_premultiplied(&mut buffer);
+            painter.clear(0x123456);
+            painter.push_clip(Rect::new(1, 1, 2, 1));
+            painter.erase_rect(Rect::new(-10, -10, 30, 30));
+            painter.pop_clip();
+            painter.put(0, 0, 0xabcdef);
+        }
+        assert_eq!(buffer.pixels[0], 0xffab_cdef);
+        assert_eq!(buffer.pixels[5..7], [0, 0]);
+        assert_eq!(buffer.pixels[4], 0xff12_3456);
+        assert_eq!(buffer.pixels[7], 0xff12_3456);
+        assert!(buffer.pixels[8..].iter().all(|pixel| *pixel == 0xff12_3456));
+    }
+
+    #[test]
+    fn premultiplied_antialiased_paths_have_real_coverage_not_a_colour_key() {
+        let mut buffer = WindowBuffer::new(12, 12);
+        let mut kernel = crate::RasterKernel::new();
+        Painter::new_premultiplied(&mut buffer)
+            .fill_circle_aa(&mut kernel, 6.0, 6.0, 4.3, 0, 255);
+        assert!(buffer.pixels.iter().any(|pixel| *pixel == 0xff00_0000),
+            "black objects are opaque, not treated as a transparency key");
+        assert!(buffer.pixels.iter().any(|pixel| {
+            let alpha = pixel >> 24;
+            alpha > 0 && alpha < 255
+        }));
+        assert_eq!(buffer.pixels[0], 0);
+        assert!(buffer.pixels.iter().all(|pixel| pixel & 0x00ff_ffff == 0));
+    }
 
     #[test]
     fn a_filled_rectangle_covers_exactly_its_bounds() {

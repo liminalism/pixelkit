@@ -9,6 +9,9 @@ license.workspace = true
 pixelkit-raster = { workspace = true }
 pixelkit-text = { workspace = true }
 pixelkit-shell = { workspace = true }
+accesskit = { version = "0.25", optional = true }
+zeroize = { workspace = true }
+unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 pixelkit-text = { workspace = true, features = ["test-fonts"] }
@@ -16,6 +19,7 @@ pixelkit-windowing = { workspace = true }
 
 [features]
 test-fonts = ["pixelkit-text/test-fonts"]
+accessibility = ["dep:accesskit"]
 
 [lints]
 workspace = true

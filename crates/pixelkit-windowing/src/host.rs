@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 use pixelkit_raster::WindowBuffer;
 use pixelkit_shell::{
     FrameTimer, KeyInput, Modifiers, MouseButton, PresentError, Presenter, Scale,
-    SoftbufferPresenter,
 };
+use crate::present::SoftbufferPresenter;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -161,6 +161,10 @@ pub trait PixelApp {
     /// next `render` receives it too; this is for caches keyed on scale.
     fn on_scale(&mut self, _scale: Scale) {}
 
+    /// Layout geometry changes before the next render. Identity-sensitive
+    /// surfaces should invalidate semantic targets here.
+    fn on_layout_changed(&mut self) {}
+
     /// Take a handle that wakes this window from another thread.
     ///
     /// Called once, before the loop starts. An application whose state arrives
@@ -168,6 +172,10 @@ pub trait PixelApp {
     /// difference between the screen updating when the answer arrives and the
     /// screen updating on the next timer.
     fn attach(&mut self, _waker: Waker) {}
+
+    /// Called once per native window creation, before initial presentation. Platform integration
+    /// may borrow its raw handles here; it must retire associated resources in `on_exit`.
+    fn on_native_window(&mut self, _window: &Window) {}
 
     /// How soon the application wants the next unprompted redraw. `None` waits
     /// for input or a wake; a duration ticks.
@@ -192,6 +200,9 @@ pub trait PixelApp {
     /// for showing the in-progress composition. Direct-key typing — Thai
     /// stacks included — still arrives through `on_key`, unchanged.
     fn on_ime(&mut self, _ime: &ImeEvent) {}
+    /// Native window keyboard focus changed. Cancel composition and pending
+    /// asynchronous field edits on loss, without destroying logical field focus.
+    fn on_focus_changed(&mut self, _focused: bool) {}
 
     /// A new window title to apply, or `None` for no change. The shell drains
     /// this every frame and calls `Window::set_title`, so per-section
@@ -227,6 +238,11 @@ pub trait PixelApp {
 
     fn on_exit(&mut self) {}
 
+    /// Window creation or presentation failed. Called before this window is
+    /// retired; applications with pending requests must report infrastructure
+    /// failure rather than treating `on_exit` as user cancellation.
+    fn on_host_error(&mut self, _error: &str) {}
+
     /// The modifier state changed. Delivered separately from the keys it
     /// modifies, because shift-clicking is a mouse event that needs to know.
     fn on_modifiers(&mut self, _modifiers: Modifiers) {}
@@ -250,6 +266,10 @@ pub trait PixelApp {
 
     /// Pinch / magnify. `delta` is the platform's magnification step.
     fn on_magnify(&mut self, _phase: GesturePhase, _delta: f64) {}
+
+    /// Whether a text input currently owns IME. The default preserves legacy
+    /// applications; focused-control surfaces should override it.
+    fn ime_allowed(&self) -> bool { true }
 
     /// Caret rectangle for the IME candidate window, in physical pixels.
     /// `None` leaves the platform's last rectangle alone.
@@ -288,6 +308,8 @@ pub trait PixelApp {
     /// published, such as a click on a button.
     #[cfg(feature = "accessibility")]
     fn on_accessibility_action(&mut self, _request: accesskit::ActionRequest) {}
+    #[cfg(feature = "accessibility")]
+    fn on_accessibility_deactivated(&mut self) {}
 }
 
 /// A window an application wants opened or closed. See
@@ -335,6 +357,13 @@ pub struct WindowConfig {
     /// view, the usual companion to `titlebar_transparent`. Ignored
     /// elsewhere.
     pub fullsize_content_view: bool,
+    /// Per-window startup token; concurrent requests never race global env.
+    pub activation_token: Option<String>,
+    /// Linux: the Wayland app_id and the X11 `WM_CLASS` general/instance
+    /// name (reverse-DNS, e.g. `org.example.App`). Without it the window
+    /// carries no identity, so the taskbar cannot group it with its launcher
+    /// icon. Ignored on every other platform.
+    pub app_id: Option<String>,
 }
 
 impl WindowConfig {
@@ -349,6 +378,8 @@ impl WindowConfig {
             titlebar_transparent: false,
             title_hidden: false,
             fullsize_content_view: false,
+            activation_token: None,
+            app_id: None,
         }
     }
 
@@ -379,6 +410,7 @@ struct Slot {
     /// First input since the last present. Cleared when that present is timed.
     input_at: Option<Instant>,
     modifiers: Modifiers,
+    native_focused: bool,
     /// When the next unprompted repaint is due, for an app that asked for an
     /// interval. `None` until the first one is scheduled.
     next_tick: Option<Instant>,
@@ -411,6 +443,7 @@ impl Slot {
             pending_tick: Duration::ZERO,
             input_at: None,
             modifiers: Modifiers::default(),
+            native_focused: true,
             next_tick: None,
             cursor_shape: CursorShape::Default,
             #[cfg(feature = "accessibility")]
@@ -449,17 +482,23 @@ impl Slot {
         }
         if self.buffer.width != size.width || self.buffer.height != size.height {
             self.buffer.resize(size.width, size.height);
-            if presenter.resize(size.width, size.height).is_err() {
+            if let Err(error) = presenter.resize(size.width, size.height) {
+                self.app.on_host_error(&error.to_string());
                 return;
             }
-        }
-        if let Some(area) = self.app.ime_cursor_area() {
-            apply_ime(window, Some(area));
         }
         let started = Instant::now();
         self.app.render(&mut self.buffer, self.scale);
         let painted = Instant::now();
-        let _ = presenter.present(&self.buffer);
+        if self.app.ime_allowed() {
+            apply_ime(window, self.app.ime_cursor_area());
+        } else {
+            window.set_ime_allowed(false);
+        }
+        if let Err(error) = presenter.present(&self.buffer) {
+            self.app.on_host_error(&error.to_string());
+            return;
+        }
         let presented = Instant::now();
         let input_to_present = self
             .input_at
@@ -513,6 +552,10 @@ struct Shell {
     /// Taken per window but never consumed, so windows opened later —
     /// including ones requested at runtime — get the same presenter.
     shared_presenter: Option<MultiPresenterFactory>,
+    /// A persistent service delivers new applications on the main thread.
+    incoming: Option<Box<dyn FnMut() -> Vec<(WindowConfig, Box<dyn PixelApp>)>>>,
+    waker: Waker,
+    failure: Option<String>,
     #[cfg(feature = "accessibility")]
     proxy: EventLoopProxy<Host>,
 }
@@ -533,6 +576,19 @@ impl Shell {
         if let (Some(w), Some(h)) = (slot.config.min_width, slot.config.min_height) {
             attributes = attributes.with_min_inner_size(LogicalSize::new(w, h));
         }
+        #[cfg(target_os = "linux")]
+        if let Some(token) = &slot.config.activation_token {
+            use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+            attributes = attributes.with_activation_token(winit::window::ActivationToken::from_raw(token.clone()));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(app_id) = &slot.config.app_id {
+            // One field feeds both backends: the Wayland app_id and the X11
+            // WM_CLASS pair. The x11 trait's `with_name` writes the same
+            // field, so importing one of the two is enough.
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes = attributes.with_name(app_id.clone(), app_id.clone());
+        }
         #[cfg(target_os = "macos")]
         {
             attributes = attributes
@@ -546,11 +602,16 @@ impl Shell {
             // the first thing assistive technology sees is a described window.
             attributes = attributes.with_visible(false);
         }
-        let window = Arc::new(
-            event_loop
-                .create_window(attributes)
-                .expect("a window should be creatable"),
-        );
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                let error = error.to_string();
+                self.failure = Some(error);
+                event_loop.exit();
+                return;
+            }
+        };
+        slot.app.on_native_window(&window);
         #[cfg(feature = "accessibility")]
         {
             slot.accessibility = Some(accesskit_winit::Adapter::with_event_loop_proxy(
@@ -560,15 +621,27 @@ impl Shell {
             ));
             window.set_visible(true);
         }
-        apply_ime(&window, slot.app.ime_cursor_area());
-        let presenter: Box<dyn Presenter> = match slot.presenter_factory.take() {
-            Some(factory) => factory(window.clone()).expect("the application's presenter"),
+        if slot.app.ime_allowed() {
+            apply_ime(&window, slot.app.ime_cursor_area());
+        } else {
+            window.set_ime_allowed(false);
+        }
+        let presenter = match slot.presenter_factory.take() {
+            Some(factory) => factory(window.clone()),
             None => match &mut self.shared_presenter {
-                Some(factory) => factory(window.clone()).expect("the application's presenter"),
-                None => Box::new(
-                    SoftbufferPresenter::new(window.clone()).expect("a software presenter"),
-                ),
+                Some(factory) => factory(window.clone()),
+                None => SoftbufferPresenter::new(window.clone())
+                    .map(|presenter| Box::new(presenter) as Box<dyn Presenter>),
             },
+        };
+        let presenter = match presenter {
+            Ok(presenter) => presenter,
+            Err(error) => {
+                let error = error.to_string();
+                self.failure = Some(error);
+                event_loop.exit();
+                return;
+            }
         };
         slot.scale = Scale::new(window.scale_factor());
         slot.app.on_scale(slot.scale);
@@ -714,6 +787,12 @@ fn function_key(named: NamedKey) -> Option<u8> {
 /// The whole string a key committed. Navigation keys contribute nothing, so
 /// Tab stays a key instead of the `"\t"` winit attaches to it.
 pub fn committed_text(logical: &Key, text: Option<&str>) -> String {
+    // Space and some keypad/IME platform keys are named or unidentified but still
+    // translate to text. Use the same classification as on_key; otherwise the
+    // full-text path silently drops characters the legacy path accepts.
+    if !matches!(translate(logical, text), Some(KeyInput::Character(_))) {
+        return String::new();
+    }
     match logical {
         Key::Character(characters) => {
             if let Some(text) = text.filter(|text| !text.is_empty()) {
@@ -722,7 +801,7 @@ pub fn committed_text(logical: &Key, text: Option<&str>) -> String {
                 characters.to_string()
             }
         }
-        _ => String::new(),
+        _ => text.unwrap_or_default().to_owned(),
     }
 }
 
@@ -932,13 +1011,18 @@ impl ApplicationHandler<Host> for Shell {
                                 adapter.update_if_active(|| tree);
                             }
                         }
+                        slot.request_redraw();
                     }
                     Access::ActionRequested(request) => {
                         let slot = &mut self.slots[index];
                         slot.app.on_accessibility_action(request);
                         slot.request_redraw();
                     }
-                    Access::AccessibilityDeactivated => {}
+                    Access::AccessibilityDeactivated => {
+                        let slot = &mut self.slots[index];
+                        slot.tree_published = false;
+                        slot.app.on_accessibility_deactivated();
+                    }
                 }
             }
         }
@@ -970,7 +1054,7 @@ impl ApplicationHandler<Host> for Shell {
             // One window's close box closes that window. The loop ends when
             // the last one goes, not before.
             close_slot(&mut self.slots, index);
-            if self.slots.is_empty() {
+            if self.slots.is_empty() && self.incoming.is_none() {
                 event_loop.exit();
             }
             return;
@@ -978,17 +1062,30 @@ impl ApplicationHandler<Host> for Shell {
         let slot = &mut self.slots[index];
         match event {
             WindowEvent::CloseRequested => unreachable!("handled above"),
+            WindowEvent::Focused(focused) => {
+                slot.native_focused = focused;
+                if !focused {
+                    slot.modifiers = Modifiers::default();
+                    slot.app.on_modifiers(slot.modifiers);
+                    slot.app.on_ime(&ImeEvent::Disabled);
+                }
+                slot.app.on_focus_changed(focused);
+                slot.request_redraw();
+            }
             WindowEvent::Resized(_) => {
+                slot.app.on_layout_changed();
                 slot.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 slot.scale = Scale::new(scale_factor);
+                slot.app.on_layout_changed();
                 slot.app.on_scale(slot.scale);
                 // winit follows this with a `Resized` carrying the new
                 // physical size, which triggers the repaint.
                 slot.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if !slot.native_focused { return; }
                 let physical = physical_label(event.physical_key);
                 if let Some(decoded) = interpret_key(
                     &event.logical_key,
@@ -1052,7 +1149,9 @@ impl ApplicationHandler<Host> for Shell {
                 slot.request_redraw();
             }
             WindowEvent::Ime(ime) => {
-                slot.app.on_ime(&translate_ime(&ime));
+                if (slot.native_focused && slot.app.ime_allowed()) || matches!(ime, WinitIme::Disabled) {
+                    slot.app.on_ime(&translate_ime(&ime));
+                }
                 slot.note_input();
                 slot.request_redraw();
             }
@@ -1062,7 +1161,13 @@ impl ApplicationHandler<Host> for Shell {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if !drain_requests(&mut self.slots) {
+        if let Some(incoming) = &mut self.incoming {
+            for (config, mut app) in incoming() {
+                app.attach(self.waker.clone());
+                open_slot(&mut self.slots, config, app);
+            }
+        }
+        if !drain_requests(&mut self.slots) && self.incoming.is_none() {
             event_loop.exit();
             return;
         }
@@ -1081,9 +1186,6 @@ impl ApplicationHandler<Host> for Shell {
             );
         }
         if self.slots.iter().any(|slot| slot.app.should_exit()) {
-            for slot in &mut self.slots {
-                slot.app.on_exit();
-            }
             event_loop.exit();
             return;
         }
@@ -1183,6 +1285,9 @@ fn run_inner(
     let mut shell = Shell {
         slots,
         shared_presenter,
+        incoming: None,
+        waker: Waker { proxy: Some(event_loop.create_proxy()) },
+        failure: None,
         #[cfg(feature = "accessibility")]
         proxy: event_loop.create_proxy(),
     };
@@ -1191,8 +1296,55 @@ fn run_inner(
             proxy: Some(event_loop.create_proxy()),
         });
     }
-    event_loop.run_app(&mut shell)?;
+    let result = event_loop.run_app(&mut shell);
+    if let Err(error) = &result { shell.failure = Some(error.to_string()); }
+    finish_host(&mut shell);
+    result?;
+    if let Some(error) = shell.failure {
+        return Err(std::io::Error::other(error).into());
+    }
     Ok(())
+}
+
+/// Build once on the process main thread. `start` hands the wake handle to an
+/// asynchronous producer; `incoming` constructs windows on this thread only.
+/// Unlike `run_windows`, closing the last window leaves this service asleep,
+/// ready for the next request. Use `WindowRequest::Close` for per-window exit.
+pub fn run_window_service(
+    start: impl FnOnce(Waker),
+    incoming: impl FnMut() -> Vec<(WindowConfig, Box<dyn PixelApp>)> + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let event_loop = EventLoop::<Host>::with_user_event().build()?;
+    let waker = Waker { proxy: Some(event_loop.create_proxy()) };
+    let mut shell = Shell {
+        slots: Vec::new(),
+        shared_presenter: None,
+        incoming: Some(Box::new(incoming)),
+        waker: waker.clone(),
+        failure: None,
+        #[cfg(feature = "accessibility")]
+        proxy: event_loop.create_proxy(),
+    };
+    start(waker);
+    let result = event_loop.run_app(&mut shell);
+    if let Err(error) = &result { shell.failure = Some(error.to_string()); }
+    finish_host(&mut shell);
+    result?;
+    if let Some(error) = shell.failure {
+        return Err(std::io::Error::other(error).into());
+    }
+    Ok(())
+}
+
+fn finish_host(shell: &mut Shell) {
+    for slot in &mut shell.slots {
+        if let Some(error) = shell.failure.as_deref() {
+            slot.app.on_host_error(error);
+        } else if shell.incoming.is_some() {
+            slot.app.on_host_error("graphical host stopped");
+        }
+        slot.app.on_exit();
+    }
 }
 
 #[cfg(test)]
@@ -1463,6 +1615,27 @@ mod tests {
         assert!(released.text.is_empty());
         assert!(released.modifiers.shift);
         assert_eq!(released.physical, "KeyA");
+    }
+
+    #[test]
+    fn named_space_commits_text_without_turning_navigation_into_text() {
+        let event = interpret_key(
+            &Key::Named(NamedKey::Space), Some(" "), "Space", true, false,
+            Modifiers::default(),
+        ).unwrap();
+        assert_eq!(event.key, KeyInput::Character(' '));
+        assert_eq!(event.text, " ");
+        for (key, text) in [(NamedKey::Tab, "\t"), (NamedKey::Enter, "\r")] {
+            let event = interpret_key(
+                &Key::Named(key), Some(text), "navigation", true, false,
+                Modifiers::default(),
+            ).unwrap();
+            assert_eq!(event.text, "");
+        }
+        assert_eq!(
+            committed_text(&Key::Unidentified(winit::keyboard::NativeKey::Unidentified), Some("7")),
+            "7",
+        );
     }
 
     #[test]

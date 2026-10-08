@@ -17,5 +17,5 @@ pub use clipboard::Clipboard;
 pub use frame_log::{FrameSnapshot, FrameTimer, PhaseStats};
 pub use input::{Input, KeyInput, Modifiers, MouseButton};
 pub use platform::{beep, system_accent};
-pub use present::{PresentError, Presenter, PresenterBackend, SoftbufferPresenter};
+pub use present::{PresentError, Presenter, PresenterBackend};
 pub use scale::Scale;
